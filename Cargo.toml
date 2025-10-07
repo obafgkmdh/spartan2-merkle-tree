@@ -1,0 +1,17 @@
+[package]
+name = "spartan2-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bellpepper-core = "0.4.0"
+bellpepper = "0.4.0"
+ff = { version = "0.13.0", features = ["derive"] }
+spartan2 = { git = "https://github.com/microsoft/Spartan2.git" }
+sha2 = "0.10.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
+merkle-trees = { git = "https://github.com/varunthakore/merkle-trees.git" }
+neptune = { version = "13.0.0", default-features = false }
+generic-array = "1.0.0"
+rand = { version = "0.9.2", features = ["small_rng"] }

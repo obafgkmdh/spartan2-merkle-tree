@@ -22,29 +22,29 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 type E = T256HyraxEngine;
-const HEIGHT: usize = 20;
+const HEIGHT: usize = 15;
 
 #[derive(Clone, Debug)]
 struct MerkleTreeCircuit<Scalar: PrimeField + PrimeFieldBits> {
-    inputs: Vec<Scalar>,
+    leaves: Vec<Scalar>,
     tree: MerkleTree<Scalar, HEIGHT, U1, U2>,
 }
 
 impl<Scalar: PrimeField + PrimeFieldBits> MerkleTreeCircuit<Scalar> {
-    fn new(inputs: Vec<Scalar>) -> Self {
+    fn new(leaves: Vec<Scalar>) -> Self {
         let mut tree = MerkleTree::new(vanilla_tree::tree::Leaf::default());
 
-        for i in 0..inputs.len() {
+        for i in 0..leaves.len() {
             let idx = Scalar::from(i as u64);
             let idx_in_bits = idx_to_bits(HEIGHT, idx);
             let val = Leaf {
-                val: vec![inputs[i]],
+                val: vec![leaves[i]],
                 _arity: PhantomData::<U1>,
             };
             tree.insert(idx_in_bits.clone(), &val);
         }
 
-        Self { inputs, tree }
+        Self { leaves, tree }
     }
 }
 
@@ -67,20 +67,6 @@ impl<E: Engine> SpartanCircuit<E> for MerkleTreeCircuit<E::Scalar> {
         cs: &mut CS,
         _: &[AllocatedNum<E::Scalar>], // shared variables, if any
     ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
-        let index = 5;
-        let index_scalar = E::Scalar::from(index as u64);
-
-        let index_bits = idx_to_bits(HEIGHT, index_scalar);
-
-        let index_bits_var = index_bits
-            .clone()
-            .into_iter()
-            .enumerate()
-            .map(|(i, b)| {
-                AllocatedBit::alloc(cs.namespace(|| format!("preimage bit {i}")), Some(b))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let root_var =
             AllocatedNum::alloc(cs.namespace(|| format!("tree root")), || Ok(self.tree.root))?;
 
@@ -92,44 +78,59 @@ impl<E: Engine> SpartanCircuit<E> for MerkleTreeCircuit<E::Scalar> {
             |lc| lc + input.get_variable(),
         );
 
-        let siblings_path = self.tree.get_siblings_path(index_bits.clone());
+        for index in 0..100 {
+            let index_scalar = E::Scalar::from(index as u64);
 
-        let val = self.inputs[index];
-        let leaf = Leaf {
-            val: vec![val],
-            _arity: PhantomData::<U1>,
-        };
-        assert!(
-            siblings_path.verify(index_bits, &leaf, self.tree.root),
-            "leaf should verify"
-        );
+            let index_bits = idx_to_bits(HEIGHT, index_scalar);
 
-        let siblings_var = siblings_path
-            .siblings
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| AllocatedNum::alloc(cs.namespace(|| format!("sibling {i}")), || Ok(s)))
-            .collect::<Result<Vec<_>, _>>()?;
+            let index_bits_var = index_bits
+                .clone()
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    AllocatedBit::alloc(cs.namespace(|| format!("index {index} preimage bit {i}")), Some(b))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-        let input_var = leaf.val
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| AllocatedNum::alloc(cs.namespace(|| format!("leaf val {i}")), || Ok(s)))
-            .collect::<Result<Vec<_>, _>>()?;
+            let siblings_path = self.tree.get_siblings_path(index_bits.clone());
 
-        let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-            cs,
-            root_var,
-            input_var,
-            index_bits_var,
-            siblings_var,
-        )?);
+            let val = self.leaves[index];
+            let leaf = Leaf {
+                val: vec![val],
+                _arity: PhantomData::<U1>,
+            };
+            assert!(
+                siblings_path.verify(index_bits, &leaf, self.tree.root),
+                "leaf should verify"
+            );
 
-        Boolean::enforce_equal(
-            cs.namespace(|| format!("enforce true")),
-            &is_valid,
-            &Boolean::constant(true),
-        )?;
+            let siblings_var = siblings_path
+                .siblings
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| AllocatedNum::alloc(cs.namespace(|| format!("index {index} sibling {i}")), || Ok(s)))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let input_var = leaf.val
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| AllocatedNum::alloc(cs.namespace(|| format!("index {index} leaf val {i}")), || Ok(s)))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
+                &mut cs.namespace(|| format!("valid {index}")),
+                root_var.clone(),
+                input_var,
+                index_bits_var,
+                siblings_var,
+            )?);
+
+            Boolean::enforce_equal(
+                cs.namespace(|| format!("enforce true {index}")),
+                &is_valid,
+                &Boolean::constant(true),
+            )?;
+        }
 
         Ok(vec![])
     }
@@ -164,7 +165,7 @@ fn main() {
 
     let circuit = MerkleTreeCircuit::<<E as Engine>::Scalar>::new(input);
 
-    let n_inputs = circuit.inputs.len();
+    let n_inputs = circuit.leaves.len();
     let root_span = info_span!("bench", n_inputs).entered();
     info!("======= n_inputs={} =======", n_inputs);
 
@@ -173,6 +174,7 @@ fn main() {
     let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).expect("setup failed");
     let setup_ms = t0.elapsed().as_millis();
     info!(elapsed_ms = setup_ms, "setup");
+    info!("Constraint count is: {}", pk.sizes()[0]);
 
     // PREPARE
     let t0 = Instant::now();

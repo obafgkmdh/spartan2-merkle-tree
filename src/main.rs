@@ -32,17 +32,15 @@ struct MerkleTreeCircuit<Scalar: PrimeField + PrimeFieldBits> {
 
 impl<Scalar: PrimeField + PrimeFieldBits> MerkleTreeCircuit<Scalar> {
     fn new(leaves: Vec<Scalar>) -> Self {
-        let merkle_leaves = leaves.iter().map(|&val| {
-            Leaf {
+        let merkle_leaves = leaves
+            .iter()
+            .map(|&val| Leaf {
                 val: vec![val],
                 _arity: PhantomData::<U1>,
-            }
-        }).collect();
+            })
+            .collect();
 
-        let tree = MerkleTree::from_vec(
-            merkle_leaves,
-            vanilla_tree::tree::Leaf::default()
-        );
+        let tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
 
         Self { leaves, tree }
     }
@@ -70,7 +68,9 @@ impl<E: Engine> SpartanCircuit<E> for MerkleTreeCircuit<E::Scalar> {
         let root_var =
             AllocatedNum::alloc(cs.namespace(|| format!("tree root")), || Ok(self.tree.root))?;
 
-        let input = AllocatedNum::alloc_input(cs.namespace(|| format!("public input")), || Ok(self.tree.root))?;
+        let input = AllocatedNum::alloc_input(cs.namespace(|| format!("public input")), || {
+            Ok(self.tree.root)
+        })?;
         cs.enforce(
             || "enforce input == root",
             |lc| lc + root_var.get_variable(),
@@ -88,7 +88,10 @@ impl<E: Engine> SpartanCircuit<E> for MerkleTreeCircuit<E::Scalar> {
                 .into_iter()
                 .enumerate()
                 .map(|(i, b)| {
-                    AllocatedBit::alloc(cs.namespace(|| format!("index {index} preimage bit {i}")), Some(b))
+                    AllocatedBit::alloc(
+                        cs.namespace(|| format!("index {index} preimage bit {i}")),
+                        Some(b),
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -108,13 +111,24 @@ impl<E: Engine> SpartanCircuit<E> for MerkleTreeCircuit<E::Scalar> {
                 .siblings
                 .into_iter()
                 .enumerate()
-                .map(|(i, s)| AllocatedNum::alloc(cs.namespace(|| format!("index {index} sibling {i}")), || Ok(s)))
+                .map(|(i, s)| {
+                    AllocatedNum::alloc(
+                        cs.namespace(|| format!("index {index} sibling {i}")),
+                        || Ok(s),
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let input_var = leaf.val
+            let input_var = leaf
+                .val
                 .into_iter()
                 .enumerate()
-                .map(|(i, s)| AllocatedNum::alloc(cs.namespace(|| format!("index {index} leaf val {i}")), || Ok(s)))
+                .map(|(i, s)| {
+                    AllocatedNum::alloc(
+                        cs.namespace(|| format!("index {index} leaf val {i}")),
+                        || Ok(s),
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
 
             let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
@@ -167,7 +181,7 @@ fn main() {
 
     let n_inputs = circuit.leaves.len();
     let root_span = info_span!("bench", n_inputs).entered();
-    info!("======= n_inputs={} =======", n_inputs);
+    info!("======= height={}, n_inputs={} =======", HEIGHT, n_inputs);
 
     // SETUP
     let t0 = Instant::now();

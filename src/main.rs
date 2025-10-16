@@ -22,7 +22,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 type E = T256HyraxEngine;
-const HEIGHT: usize = 15;
+const HEIGHT: usize = 20;
 
 #[derive(Clone, Debug)]
 struct MerkleTreeCircuit<Scalar: PrimeField + PrimeFieldBits> {
@@ -32,17 +32,17 @@ struct MerkleTreeCircuit<Scalar: PrimeField + PrimeFieldBits> {
 
 impl<Scalar: PrimeField + PrimeFieldBits> MerkleTreeCircuit<Scalar> {
     fn new(leaves: Vec<Scalar>) -> Self {
-        let mut tree = MerkleTree::new(vanilla_tree::tree::Leaf::default());
-
-        for i in 0..leaves.len() {
-            let idx = Scalar::from(i as u64);
-            let idx_in_bits = idx_to_bits(HEIGHT, idx);
-            let val = Leaf {
-                val: vec![leaves[i]],
+        let merkle_leaves = leaves.iter().map(|&val| {
+            Leaf {
+                val: vec![val],
                 _arity: PhantomData::<U1>,
-            };
-            tree.insert(idx_in_bits.clone(), &val);
-        }
+            }
+        }).collect();
+
+        let tree = MerkleTree::from_vec(
+            merkle_leaves,
+            vanilla_tree::tree::Leaf::default()
+        );
 
         Self { leaves, tree }
     }
@@ -159,7 +159,7 @@ fn main() {
         .init();
 
     let mut rng = SmallRng::seed_from_u64(1);
-    let input = (0..(1 << 15))
+    let input = (0..10000)
         .map(|_| <E as Engine>::Scalar::from(rng.random::<u64>()))
         .collect();
 

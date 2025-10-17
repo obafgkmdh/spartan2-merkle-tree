@@ -66,32 +66,53 @@ impl<F: PrimeField + PrimeFieldBits, const N: usize, AL: Arity<F>, AN: Arity<F>>
         let mut hash_db = HashMap::<String, (F, F)>::new();
         let leaf_hash_params = Sponge::<F, AL>::api_constants(Strength::Standard);
         let node_hash_params = Sponge::<F, AN>::api_constants(Strength::Standard);
-        // Insert all the leaves. We keep a list of the most recent "left hash" on each level
+        // Insert all the leaves. We keep a list of any outstanding "left hash" on each level
         let mut left_hashes: Vec<Option<F>> = Vec::new();
         left_hashes.resize(N + 1, None);
         for i in 0..leaves.len() {
             let mut right_hash = Leaf::<F, AL>::hash_leaf(&leaves[i], &leaf_hash_params);
             let mut level = 0;
-            // If i in binary ends with k 1s, we need to perform k hashes
-            while level < N && ((i >> level) & 1) == 1 {
-                let left_hash = left_hashes[level].unwrap();
-                let val = (left_hash.clone(), right_hash.clone());
-                right_hash = hash(vec![left_hash.clone(), right_hash.clone()], &node_hash_params);
-                hash_db.insert(format!("{:?}", right_hash.clone()), val);
+            // Hash upwards until there is no left hash
+            while level < N {
+                match left_hashes[level] {
+                    Some(left_hash) => {
+                        // combine left hash with right hash
+                        let val = (left_hash.clone(), right_hash.clone());
+                        right_hash = hash(vec![left_hash.clone(), right_hash.clone()], &node_hash_params);
+                        hash_db.insert(format!("{:?}", right_hash.clone()), val);
+                        left_hashes[level] = None;
+                    },
+                    None => {
+                        break;
+                    }
+                }
                 level += 1;
             }
             left_hashes[level] = Some(right_hash);
         }
         // Insert remaining empty leaves
         let mut empty_hash = Leaf::<F, AL>::hash_leaf(&empty_leaf_val, &leaf_hash_params);
+        let mut right_hash = empty_hash.clone();
         for level in 0..N {
-            if ((leaves.len() >> level) & 1) == 1 || (leaves.len() >> level) == 0 {
-                // combine left hash with empty_hash
-                let left_hash = left_hashes[level].unwrap();
-                let val = (left_hash.clone(), empty_hash.clone());
-                let next_hash = hash(vec![left_hash.clone(), empty_hash.clone()], &node_hash_params);
-                left_hashes[level + 1] = Some(next_hash);
-                hash_db.insert(format!("{:?}", next_hash.clone()), val);
+            match left_hashes[level] {
+                Some(left_hash) => {
+                    // combine left hash with right hash
+                    let val = (left_hash.clone(), right_hash.clone());
+                    let next_hash = hash(vec![left_hash.clone(), right_hash.clone()], &node_hash_params);
+                    hash_db.insert(format!("{:?}", next_hash.clone()), val);
+                    match left_hashes[level + 1] {
+                        Some(_) => {
+                            right_hash = next_hash.clone();
+                        },
+                        None => {
+                            left_hashes[level + 1] = Some(next_hash);
+                        }
+                    }
+                },
+                None => {
+                    // right hash becomes the empty hash for this level
+                    right_hash = empty_hash.clone();
+                },
             }
             // compute empty_hash for next level
             let val = (empty_hash.clone(), empty_hash.clone());

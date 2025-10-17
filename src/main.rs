@@ -11,10 +11,10 @@ use tracing_subscriber::EnvFilter;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-mod membership_circuit;
+mod aggregation_circuit;
 
 type E = T256HyraxEngine;
-const HEIGHT: usize = 20;
+const HEIGHT: usize = 15;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -24,11 +24,12 @@ fn main() {
         .init();
 
     let mut rng = SmallRng::seed_from_u64(1);
-    let input = (0..10000)
+    let input = (0..1000)
         .map(|_| <E as Engine>::Scalar::from(rng.random::<u64>()))
         .collect();
 
-    let circuit = membership_circuit::MerkleTreeMembershipCircuit::<<E as Engine>::Scalar, HEIGHT>::new(input);
+    let circuit =
+        aggregation_circuit::AggregationCircuit::<<E as Engine>::Scalar, HEIGHT>::new(input);
 
     let n_inputs = circuit.leaves.len();
     let root_span = info_span!("bench", HEIGHT, n_inputs).entered();

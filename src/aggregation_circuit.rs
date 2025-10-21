@@ -8,27 +8,41 @@ use ff::{PrimeField, PrimeFieldBits};
 use spartan2::traits::{Engine, circuit::SpartanCircuit};
 use std::marker::PhantomData;
 
-use generic_array::typenum::{U1, U2};
+use generic_array::typenum::{Const, ToUInt, U, U2};
 use merkle_trees::hash::circuit::hash_circuit;
 use merkle_trees::vanilla_tree;
 use merkle_trees::vanilla_tree::circuit::path_verify_circuit;
 use merkle_trees::vanilla_tree::tree::{Leaf, MerkleTree, idx_to_bits};
 
-#[derive(Clone, Debug)]
-pub struct AggregationCircuit<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize> {
-    pub leaves: Vec<Scalar>, // Raw logs
-    pub hashes: Vec<Scalar>, // Hashes of logs
-    pub tree: MerkleTree<Scalar, HEIGHT, U1, U2>, // Previous tree
-                             // TODO: Add fields for modified and inserted logs, and new tree
+use neptune::poseidon::Arity;
+
+#[derive(Clone)]
+pub struct AggregationCircuit<
+    Scalar: PrimeField + PrimeFieldBits,
+    const HEIGHT: usize,
+    const BATCH_SIZE: usize,
+> where
+    Const<BATCH_SIZE>: ToUInt,
+    U<BATCH_SIZE>: Arity<Scalar>,
+{
+    pub raw_logs: Vec<[Scalar; BATCH_SIZE]>, // Raw logs, batched
+    pub hashes: Vec<Scalar>,                 // Hashes of batched logs
+    pub tree: MerkleTree<Scalar, HEIGHT, U<BATCH_SIZE>, U2>, // Previous tree
+                                             // TODO: Add fields for modified and inserted logs, and new tree
 }
 
-impl<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize> AggregationCircuit<Scalar, HEIGHT> {
-    pub fn new(leaves: Vec<Scalar>) -> Self {
-        let merkle_leaves: Vec<_> = leaves
+impl<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize, const BATCH_SIZE: usize>
+    AggregationCircuit<Scalar, HEIGHT, BATCH_SIZE>
+where
+    Const<BATCH_SIZE>: ToUInt,
+    U<BATCH_SIZE>: Arity<Scalar>,
+{
+    pub fn new(raw_logs: Vec<[Scalar; BATCH_SIZE]>) -> Self {
+        let merkle_leaves: Vec<_> = raw_logs
             .iter()
-            .map(|&val| Leaf {
-                val: vec![val],
-                _arity: PhantomData::<U1>,
+            .map(|&batch| Leaf {
+                val: batch.to_vec(),
+                _arity: PhantomData::<U<BATCH_SIZE>>,
             })
             .collect();
 
@@ -40,14 +54,19 @@ impl<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize> AggregationCircui
             .collect();
 
         Self {
-            leaves,
+            raw_logs,
             hashes,
             tree,
         }
     }
 }
 
-impl<E: Engine, const HEIGHT: usize> SpartanCircuit<E> for AggregationCircuit<E::Scalar, HEIGHT> {
+impl<E: Engine, const HEIGHT: usize, const BATCH_SIZE: usize> SpartanCircuit<E>
+    for AggregationCircuit<E::Scalar, HEIGHT, BATCH_SIZE>
+where
+    Const<BATCH_SIZE>: ToUInt,
+    U<BATCH_SIZE>: Arity<E::Scalar> + Sync + Send,
+{
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
         // Previous tree root is public, along with leaf hashes
         let mut public_values = vec![self.tree.root];
@@ -84,7 +103,7 @@ impl<E: Engine, const HEIGHT: usize> SpartanCircuit<E> for AggregationCircuit<E:
 
         // Check that all the leaves hash into the public hash values
         let leaf_hash_params = &self.tree.leaf_hash_params;
-        for (idx, &leaf) in self.leaves.iter().enumerate() {
+        for (idx, &batch) in self.raw_logs.iter().enumerate() {
             let hash_input = AllocatedNum::alloc_input(
                 cs.namespace(|| format!("public leaf hash {idx}")),
                 || Ok(self.hashes[idx]),
@@ -102,12 +121,20 @@ impl<E: Engine, const HEIGHT: usize> SpartanCircuit<E> for AggregationCircuit<E:
                 |lc| lc + hash_input.get_variable(),
             );
 
-            let leaf_var =
-                AllocatedNum::alloc(cs.namespace(|| format!("leaf index {idx}")), || Ok(leaf))?;
+            let leaf_var = batch
+                .iter()
+                .enumerate()
+                .map(|(i, &log)| {
+                    AllocatedNum::alloc(
+                        cs.namespace(|| format!("leaf index {idx}, log {i}")),
+                        || Ok(log),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             let hashed_leaf = hash_circuit(
                 &mut cs.namespace(|| format!("leaf hash {idx}")),
-                vec![leaf_var],
+                leaf_var,
                 &leaf_hash_params,
             )
             .unwrap();
@@ -144,10 +171,10 @@ impl<E: Engine, const HEIGHT: usize> SpartanCircuit<E> for AggregationCircuit<E:
 
             let siblings_path = self.tree.get_siblings_path(index_bits.clone());
 
-            let val = self.leaves[index];
+            let val = self.raw_logs[index];
             let leaf = Leaf {
-                val: vec![val],
-                _arity: PhantomData::<U1>,
+                val: val.to_vec(),
+                _arity: PhantomData::<U<BATCH_SIZE>>,
             };
             assert!(
                 siblings_path.verify(index_bits, &leaf, self.tree.root),
@@ -178,7 +205,13 @@ impl<E: Engine, const HEIGHT: usize> SpartanCircuit<E> for AggregationCircuit<E:
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
+            let is_valid = Boolean::from(path_verify_circuit::<
+                E::Scalar,
+                U<BATCH_SIZE>,
+                U2,
+                HEIGHT,
+                _,
+            >(
                 &mut cs.namespace(|| format!("valid {index}")),
                 root_var.clone(),
                 input_var,

@@ -15,6 +15,7 @@ mod aggregation_circuit;
 
 type E = T256HyraxEngine;
 const HEIGHT: usize = 15;
+const BATCH_SIZE: usize = 8;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -24,16 +25,29 @@ fn main() {
         .init();
 
     let mut rng = SmallRng::seed_from_u64(1);
-    let input = (0..1000)
+    let input: Vec<_> = (0..1000)
         .map(|_| <E as Engine>::Scalar::from(rng.random::<u64>()))
         .collect();
+    let (raw_logs, remainder) = input.as_chunks::<BATCH_SIZE>();
+    assert_eq!(
+        remainder.len(),
+        0,
+        "Number of inputs ({}) was not a multiple of the batch size ({})",
+        remainder.len(),
+        0
+    );
 
+    let raw_logs = raw_logs.to_vec();
+
+    // Create circuit
     let circuit =
-        aggregation_circuit::AggregationCircuit::<<E as Engine>::Scalar, HEIGHT>::new(input);
+        aggregation_circuit::AggregationCircuit::<<E as Engine>::Scalar, HEIGHT, BATCH_SIZE>::new(
+            raw_logs,
+        );
 
-    let n_inputs = circuit.leaves.len();
-    let root_span = info_span!("bench", HEIGHT, n_inputs).entered();
-    info!("======= height={}, n_inputs={} =======", HEIGHT, n_inputs);
+    let n_batches = circuit.raw_logs.len();
+    let root_span = info_span!("bench", HEIGHT, n_batches, BATCH_SIZE).entered();
+    info!("======= height={}, n_batches={}, batch_size={} =======", HEIGHT, n_batches, BATCH_SIZE);
 
     // SETUP
     let t0 = Instant::now();
@@ -65,7 +79,7 @@ fn main() {
     // Summary
     info!(
         "SUMMARY n_inputs={}, setup={} ms, prep_prove={} ms, prove={} ms, verify={} ms",
-        n_inputs, setup_ms, prep_ms, prove_ms, verify_ms
+        n_batches, setup_ms, prep_ms, prove_ms, verify_ms
     );
     drop(root_span);
 }

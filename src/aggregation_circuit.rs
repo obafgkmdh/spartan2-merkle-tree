@@ -45,9 +45,9 @@ pub struct AggregationCircuit<
 {
     pub raw_logs: Vec<[Log<Scalar>; BATCH_SIZE]>, // New raw logs from routers, batched
     pub hashes: Vec<Scalar>,                      // Hashes of batched logs
-    pub compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // All compressed logs, one per flow id
-    pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,        // Previous tree
-                                                              // TODO: Add fields for modified and inserted logs, and new tree
+    pub old_compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
+    pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Previous tree
+    pub _new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Updated tree
 }
 
 impl<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize, const BATCH_SIZE: usize>
@@ -58,8 +58,8 @@ where
 {
     pub fn new(raw_logs: Vec<Log<Scalar>>, num_new_batches: usize) -> Self {
         // Split the new logs into batches
-        let start_idx = raw_logs.len() - (BATCH_SIZE * num_new_batches);
-        let (batched_logs, rem) = raw_logs[start_idx..].as_chunks::<BATCH_SIZE>();
+        let new_idx = raw_logs.len() - (BATCH_SIZE * num_new_batches);
+        let (batched_logs, rem) = raw_logs[new_idx..].as_chunks::<BATCH_SIZE>();
         assert_eq!(
             rem.len(),
             0,
@@ -88,10 +88,45 @@ where
             })
             .collect();
 
-        // Compress all the logs
-        let mut compressed_logs: HashMap<_, CompressedLog<_>> = HashMap::new();
+        // Compress all the old logs
+        let mut old_compressed_logs: HashMap<_, CompressedLog<_>> = HashMap::new();
         let mut merkle_idx = 0;
-        for log in raw_logs.into_iter() {
+        for log in raw_logs[..new_idx].into_iter() {
+            match old_compressed_logs.entry(log.flow_id) {
+                Entry::Occupied(clog) => {
+                    clog.into_mut().hop_cnt += log.hop_cnt;
+                }
+                Entry::Vacant(entry) => {
+                    let clog = CompressedLog {
+                        merkle_idx,
+                        hop_cnt: log.hop_cnt,
+                    };
+                    entry.insert(clog);
+                    merkle_idx += 1;
+                }
+            }
+        }
+
+        // Build prev_tree from old compressed logs
+        let mut merkle_leaves: Vec<Option<_>> = Vec::new();
+        merkle_leaves.resize(merkle_idx, None);
+        for clog in old_compressed_logs.values() {
+            merkle_leaves[clog.merkle_idx] = Some(clog);
+        }
+
+        let merkle_leaves: Vec<_> = merkle_leaves
+            .iter()
+            .map(|clog| Leaf {
+                val: vec![clog.unwrap().hop_cnt],
+                _arity: PhantomData::<U1>,
+            })
+            .collect();
+
+        let prev_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
+
+        // Compress the rest of the logs
+        let mut compressed_logs = old_compressed_logs.clone();
+        for log in raw_logs[new_idx..].into_iter() {
             match compressed_logs.entry(log.flow_id) {
                 Entry::Occupied(clog) => {
                     clog.into_mut().hop_cnt += log.hop_cnt;
@@ -107,7 +142,7 @@ where
             }
         }
 
-        // Build tree from compressed logs
+        // Build new_tree from new compressed logs
         let mut merkle_leaves: Vec<Option<_>> = Vec::new();
         merkle_leaves.resize(merkle_idx, None);
         for clog in compressed_logs.values() {
@@ -122,13 +157,14 @@ where
             })
             .collect();
 
-        let tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
+        let new_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
 
         Self {
             raw_logs: batched_logs,
             hashes,
-            compressed_logs,
-            prev_tree: tree,
+            old_compressed_logs,
+            prev_tree,
+            _new_tree: new_tree,
         }
     }
 }
@@ -174,8 +210,8 @@ where
             |lc| lc + root_input.get_variable(),
         );
 
-        // Check that all the raw logs hash into the public hash values
         for (idx, batch) in self.raw_logs.iter().enumerate() {
+            // Check that all the new raw logs hash into the public hash values
             let hash_input = AllocatedNum::alloc_input(
                 cs.namespace(|| format!("public batch hash {idx}")),
                 || Ok(self.hashes[idx]),
@@ -227,9 +263,10 @@ where
             )?;
         }
 
-        // Membership check for compressed logs
+        // Membership check for old compressed logs
         // TODO: change this to only modified compressed logs
-        for (_flow_id, clog) in self.compressed_logs.iter() {
+        // TODO: check membership for new compressed logs
+        for (_flow_id, clog) in self.old_compressed_logs.iter() {
             let index = clog.merkle_idx;
             let index_scalar = E::Scalar::from(index as u64);
 

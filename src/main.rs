@@ -25,19 +25,16 @@ fn main() {
         .init();
 
     let mut rng = SmallRng::seed_from_u64(1);
-    let input: Vec<_> = (0..1000)
-        .map(|_| <E as Engine>::Scalar::from(rng.random::<u64>()))
+    let raw_logs: Vec<_> = (0..10)
+        .map(|_| {
+            (0..96)
+                .map(|_| aggregation_circuit::Log {
+                    flow_id: rng.random_range(0..=20),
+                    hop_cnt: <E as Engine>::Scalar::from(rng.random::<u64>()),
+                })
+                .collect()
+        })
         .collect();
-    let (raw_logs, remainder) = input.as_chunks::<BATCH_SIZE>();
-    assert_eq!(
-        remainder.len(),
-        0,
-        "Number of inputs ({}) was not a multiple of the batch size ({})",
-        remainder.len(),
-        0
-    );
-
-    let raw_logs = raw_logs.to_vec();
 
     // Create circuit
     let circuit =
@@ -47,7 +44,10 @@ fn main() {
 
     let n_batches = circuit.raw_logs.len();
     let root_span = info_span!("bench", HEIGHT, n_batches, BATCH_SIZE).entered();
-    info!("======= height={}, n_batches={}, batch_size={} =======", HEIGHT, n_batches, BATCH_SIZE);
+    info!(
+        "======= height={}, n_batches={}, batch_size={} =======",
+        HEIGHT, n_batches, BATCH_SIZE
+    );
 
     // SETUP
     let t0 = Instant::now();

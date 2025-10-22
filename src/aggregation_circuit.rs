@@ -4,7 +4,7 @@ use bellpepper_core::{
     boolean::{AllocatedBit, Boolean},
     num::AllocatedNum,
 };
-use ff::{PrimeField, PrimeFieldBits};
+use ff::{Field, PrimeField, PrimeFieldBits};
 use spartan2::traits::{Engine, circuit::SpartanCircuit};
 use std::marker::PhantomData;
 
@@ -276,45 +276,34 @@ where
                         clog.hop_cnt = clog.hop_cnt.clone() + hop_cnt_var.get_variable();
                         new_clogs.get_mut(&log.flow_id).unwrap().hop_cnt += hop_cnt;
                     }
-                    None => match self.old_compressed_logs.get(&log.flow_id) {
-                        Some(clog_old) => {
-                            modified_flows.insert(
-                                log.flow_id,
-                                CompressedLog {
-                                    merkle_idx: clog_old.merkle_idx,
-                                    hop_cnt: LinearCombination::from_coeff(
-                                        CS::one(),
-                                        clog_old.hop_cnt,
-                                    ) + hop_cnt_var.get_variable(),
-                                },
-                            );
-                            new_clogs.insert(
-                                log.flow_id,
-                                CompressedLog {
-                                    merkle_idx: clog_old.merkle_idx,
-                                    hop_cnt: clog_old.hop_cnt + hop_cnt,
-                                },
-                            );
-                        }
-                        None => {
-                            modified_flows.insert(
-                                log.flow_id,
-                                CompressedLog {
-                                    merkle_idx: merkle_idx,
-                                    hop_cnt: LinearCombination::zero() + hop_cnt_var.get_variable(),
-                                },
-                            );
-                            new_clogs.insert(
-                                log.flow_id,
-                                CompressedLog {
-                                    merkle_idx: merkle_idx,
-                                    hop_cnt: hop_cnt,
-                                },
-                            );
-                            merkle_idx += 1;
-                        }
-                    },
-                }
+                    None => {
+                        let (idx, old_hop_cnt) = match self.old_compressed_logs.get(&log.flow_id) {
+                            Some(clog_old) => (clog_old.merkle_idx, clog_old.hop_cnt),
+                            None => {
+                                let idx = merkle_idx;
+                                merkle_idx += 1;
+                                (idx, E::Scalar::ZERO)
+                            }
+                        };
+                        modified_flows.insert(
+                            log.flow_id,
+                            CompressedLog {
+                                merkle_idx: idx,
+                                hop_cnt: LinearCombination::from_coeff(
+                                    CS::one(),
+                                    old_hop_cnt,
+                                ) + hop_cnt_var.get_variable(),
+                            },
+                        );
+                        new_clogs.insert(
+                            log.flow_id,
+                            CompressedLog {
+                                merkle_idx: idx,
+                                hop_cnt: old_hop_cnt + hop_cnt,
+                            },
+                        );
+                    }
+                };
 
                 let lincomb = LinearCombination::from_coeff(
                     flow_id_var.get_variable(),

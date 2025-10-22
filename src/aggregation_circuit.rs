@@ -43,7 +43,7 @@ pub struct AggregationCircuit<
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<Scalar>,
 {
-    pub raw_logs: Vec<[Log<Scalar>; BATCH_SIZE]>, // Raw logs from routers, batched
+    pub raw_logs: Vec<[Log<Scalar>; BATCH_SIZE]>, // New raw logs from routers, batched
     pub hashes: Vec<Scalar>,                      // Hashes of batched logs
     pub compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // All compressed logs, one per flow id
     pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,        // Previous tree
@@ -56,30 +56,24 @@ where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<Scalar>,
 {
-    pub fn new(raw_logs: Vec<Vec<Log<Scalar>>>) -> Self {
-        // Split logs into batches
-        let batched_logs: Vec<[Log<Scalar>; BATCH_SIZE]> = raw_logs
-            .iter()
-            .map(|node_logs| {
-                let (batched_logs, remainder) = node_logs.as_chunks::<BATCH_SIZE>();
-                assert_eq!(
-                    remainder.len(),
-                    0,
-                    "Number of inputs ({}) was not a multiple of the batch size ({})",
-                    remainder.len(),
-                    0
-                );
-                batched_logs.to_vec()
-            })
-            .flatten()
-            .collect();
+    pub fn new(raw_logs: Vec<Log<Scalar>>, num_new_batches: usize) -> Self {
+        // Split the new logs into batches
+        let start_idx = raw_logs.len() - (BATCH_SIZE * num_new_batches);
+        let (batched_logs, rem) = raw_logs[start_idx..].as_chunks::<BATCH_SIZE>();
+        assert_eq!(
+            rem.len(),
+            0,
+            "Number of inputs ({}) was not a multiple of the batch size ({})",
+            rem.len(),
+            0
+        );
+        let batched_logs = batched_logs.to_vec();
 
         // Compute hashes of batched logs
         let log_hash_constants = Sponge::<Scalar, U<BATCH_SIZE>>::api_constants(Strength::Standard);
         let hashes = batched_logs
             .iter()
             .map(|batch| {
-                // TODO: We shouldn't need to create a Leaf object to hash a batch
                 let logs = batch
                     .iter()
                     .map(|log| {
@@ -97,7 +91,7 @@ where
         // Compress all the logs
         let mut compressed_logs: HashMap<_, CompressedLog<_>> = HashMap::new();
         let mut merkle_idx = 0;
-        for log in raw_logs.into_iter().flatten() {
+        for log in raw_logs.into_iter() {
             match compressed_logs.entry(log.flow_id) {
                 Entry::Occupied(clog) => {
                     clog.into_mut().hop_cnt += log.hop_cnt;
@@ -114,7 +108,7 @@ where
         }
 
         // Build tree from compressed logs
-        let mut merkle_leaves: Vec<Option<&CompressedLog<_>>> = Vec::new();
+        let mut merkle_leaves: Vec<Option<_>> = Vec::new();
         merkle_leaves.resize(merkle_idx, None);
         for clog in compressed_logs.values() {
             merkle_leaves[clog.merkle_idx] = Some(clog);

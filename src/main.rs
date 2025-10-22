@@ -25,21 +25,17 @@ fn main() {
         .init();
 
     let mut rng = SmallRng::seed_from_u64(1);
-    let raw_logs: Vec<_> = (0..10)
-        .map(|_| {
-            (0..96)
-                .map(|_| aggregation_circuit::Log {
-                    flow_id: rng.random_range(0..=20),
-                    hop_cnt: <E as Engine>::Scalar::from(rng.random::<u64>()),
-                })
-                .collect()
+    let raw_logs: Vec<_> = (0..1000)
+        .map(|_| aggregation_circuit::Log {
+            flow_id: rng.random_range(0..=20),
+            hop_cnt: <E as Engine>::Scalar::from(rng.random::<u64>()),
         })
         .collect();
 
     // Create circuit
     let circuit =
         aggregation_circuit::AggregationCircuit::<<E as Engine>::Scalar, HEIGHT, BATCH_SIZE>::new(
-            raw_logs,
+            raw_logs, 20,
         );
 
     let n_batches = circuit.raw_logs.len();

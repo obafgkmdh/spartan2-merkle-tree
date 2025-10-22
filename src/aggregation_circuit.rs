@@ -34,7 +34,7 @@ pub struct CompressedLog<Scalar> {
     pub hop_cnt: Scalar,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AggregationCircuit<
     Scalar: PrimeField + PrimeFieldBits,
     const HEIGHT: usize,
@@ -46,6 +46,7 @@ pub struct AggregationCircuit<
     pub raw_logs: Vec<[Log<Scalar>; BATCH_SIZE]>, // New raw logs from routers, batched
     pub hashes: Vec<Scalar>,                      // Hashes of batched logs
     pub old_compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
+    pub old_num_flows: usize,                                     // Old number of flow ids
     pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Previous tree
     pub _new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Updated tree
 }
@@ -124,6 +125,8 @@ where
 
         let prev_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
 
+        let old_num_flows = merkle_idx;
+
         // Compress the rest of the logs
         let mut compressed_logs = old_compressed_logs.clone();
         for log in raw_logs[new_idx..].into_iter() {
@@ -163,6 +166,7 @@ where
             raw_logs: batched_logs,
             hashes,
             old_compressed_logs,
+            old_num_flows,
             prev_tree,
             _new_tree: new_tree,
         }
@@ -210,6 +214,9 @@ where
             |lc| lc + root_input.get_variable(),
         );
 
+        let mut modified_flows = HashMap::<i32, CompressedLog<LinearCombination<E::Scalar>>>::new();
+        let mut merkle_idx = self.old_num_flows;
+
         for (idx, batch) in self.raw_logs.iter().enumerate() {
             // Check that all the new raw logs hash into the public hash values
             let hash_input = AllocatedNum::alloc_input(
@@ -250,6 +257,36 @@ where
                 )
                 .unwrap();
 
+                match modified_flows.get_mut(&log.flow_id) {
+                    Some(clog) => {
+                        clog.hop_cnt = clog.hop_cnt.clone() + hop_cnt_var.get_variable();
+                    }
+                    None => match self.old_compressed_logs.get(&log.flow_id) {
+                        Some(clog_old) => {
+                            modified_flows.insert(
+                                log.flow_id,
+                                CompressedLog {
+                                    merkle_idx: clog_old.merkle_idx,
+                                    hop_cnt: LinearCombination::from_coeff(
+                                        CS::one(),
+                                        clog_old.hop_cnt,
+                                    ) + hop_cnt_var.get_variable(),
+                                },
+                            );
+                        }
+                        None => {
+                            modified_flows.insert(
+                                log.flow_id,
+                                CompressedLog {
+                                    merkle_idx: merkle_idx,
+                                    hop_cnt: LinearCombination::zero() + hop_cnt_var.get_variable(),
+                                },
+                            );
+                            merkle_idx += 1;
+                        }
+                    },
+                }
+
                 let lincomb = LinearCombination::from_coeff(
                     flow_id_var.get_variable(),
                     E::Scalar::from_u128(1 << 64),
@@ -286,10 +323,8 @@ where
         }
 
         // Membership check for old compressed logs
-        // TODO: change this to only modified compressed logs
-        // TODO: check membership for new compressed logs
-        for (_flow_id, clog) in self.old_compressed_logs.iter() {
-            let index = clog.merkle_idx;
+        for (flow_id, new_clog) in modified_flows.iter() {
+            let index = new_clog.merkle_idx;
             let index_scalar = E::Scalar::from(index as u64);
 
             let index_bits = idx_to_bits(HEIGHT, index_scalar);
@@ -306,54 +341,62 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let siblings_path = self.prev_tree.get_siblings_path(index_bits.clone());
+            match self.old_compressed_logs.get(&flow_id) {
+                Some(clog) => {
+                    // Verify membership of old compressed log
+                    let siblings_path = self.prev_tree.get_siblings_path(index_bits.clone());
 
-            let leaf = Leaf {
-                val: vec![clog.hop_cnt],
-                _arity: PhantomData::<U1>,
-            };
-            assert!(
-                siblings_path.verify(index_bits, &leaf, self.prev_tree.root),
-                "compressed log {index} should verify"
-            );
+                    let leaf = Leaf {
+                        val: vec![clog.hop_cnt],
+                        _arity: PhantomData::<U1>,
+                    };
+                    assert!(
+                        siblings_path.verify(index_bits, &leaf, self.prev_tree.root),
+                        "compressed log {index} should verify"
+                    );
 
-            let siblings_var = siblings_path
-                .siblings
-                .into_iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    AllocatedNum::alloc(
-                        cs.namespace(|| format!("index {index} sibling {i}")),
-                        || Ok(s),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    let siblings_var = siblings_path
+                        .siblings
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            AllocatedNum::alloc(
+                                cs.namespace(|| format!("index {index} sibling {i}")),
+                                || Ok(s),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
 
-            let leaf_var = leaf
-                .val
-                .into_iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    AllocatedNum::alloc(
-                        cs.namespace(|| format!("index {index} leaf val {i}")),
-                        || Ok(s),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    let leaf_var = leaf
+                        .val
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            AllocatedNum::alloc(
+                                cs.namespace(|| format!("index {index} leaf val {i}")),
+                                || Ok(s),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
 
-            let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-                &mut cs.namespace(|| format!("valid {index}")),
-                root_var.clone(),
-                leaf_var,
-                index_bits_var,
-                siblings_var,
-            )?);
+                    let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
+                        &mut cs.namespace(|| format!("valid {index}")),
+                        root_var.clone(),
+                        leaf_var,
+                        index_bits_var,
+                        siblings_var,
+                    )?);
 
-            Boolean::enforce_equal(
-                cs.namespace(|| format!("enforce true {index}")),
-                &is_valid,
-                &Boolean::constant(true),
-            )?;
+                    Boolean::enforce_equal(
+                        cs.namespace(|| format!("enforce true {index}")),
+                        &is_valid,
+                        &Boolean::constant(true),
+                    )?;
+                },
+                None => {},
+            }
+
+            // Verify membership of new compressed log
         }
 
         Ok(vec![])

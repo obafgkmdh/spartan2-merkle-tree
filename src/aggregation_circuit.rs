@@ -48,7 +48,7 @@ pub struct AggregationCircuit<
     pub old_compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
     pub old_num_flows: usize,                                     // Old number of flow ids
     pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Previous tree
-    pub _new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Updated tree
+    pub new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,             // Updated tree
 }
 
 impl<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize, const BATCH_SIZE: usize>
@@ -168,7 +168,7 @@ where
             old_compressed_logs,
             old_num_flows,
             prev_tree,
-            _new_tree: new_tree,
+            new_tree,
         }
     }
 }
@@ -181,7 +181,7 @@ where
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
         // Previous tree root is public, along with leaf hashes
-        let mut public_values = vec![self.prev_tree.root];
+        let mut public_values = vec![self.prev_tree.root, self.new_tree.root];
         public_values.extend(&self.hashes);
         Ok(public_values)
     }
@@ -199,22 +199,39 @@ where
         cs: &mut CS,
         _: &[AllocatedNum<E::Scalar>], // shared variables, if any
     ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
-        let root_var = AllocatedNum::alloc(cs.namespace(|| format!("tree root")), || {
-            Ok(self.prev_tree.root)
-        })?;
+        let prev_root_var =
+            AllocatedNum::alloc(cs.namespace(|| format!("prev tree root")), || {
+                Ok(self.prev_tree.root)
+            })?;
 
-        let root_input =
-            AllocatedNum::alloc_input(cs.namespace(|| format!("public root")), || {
+        let prev_root_input =
+            AllocatedNum::alloc_input(cs.namespace(|| format!("public prev root")), || {
                 Ok(self.prev_tree.root)
             })?;
         cs.enforce(
-            || "enforce tree root == root input",
-            |lc| lc + root_var.get_variable(),
+            || "enforce prev tree root == root input",
+            |lc| lc + prev_root_var.get_variable(),
             |lc| lc + CS::one(),
-            |lc| lc + root_input.get_variable(),
+            |lc| lc + prev_root_input.get_variable(),
+        );
+
+        let new_root_var = AllocatedNum::alloc(cs.namespace(|| format!("new tree root")), || {
+            Ok(self.new_tree.root)
+        })?;
+
+        let new_root_input =
+            AllocatedNum::alloc_input(cs.namespace(|| format!("public new root")), || {
+                Ok(self.new_tree.root)
+            })?;
+        cs.enforce(
+            || "enforce new tree root == root input",
+            |lc| lc + new_root_var.get_variable(),
+            |lc| lc + CS::one(),
+            |lc| lc + new_root_input.get_variable(),
         );
 
         let mut modified_flows = HashMap::<i32, CompressedLog<LinearCombination<E::Scalar>>>::new();
+        let mut new_clogs = HashMap::<i32, CompressedLog<E::Scalar>>::new();
         let mut merkle_idx = self.old_num_flows;
 
         for (idx, batch) in self.raw_logs.iter().enumerate() {
@@ -257,9 +274,11 @@ where
                 )
                 .unwrap();
 
+                // Keep track of new/modified flows
                 match modified_flows.get_mut(&log.flow_id) {
                     Some(clog) => {
                         clog.hop_cnt = clog.hop_cnt.clone() + hop_cnt_var.get_variable();
+                        new_clogs.get_mut(&log.flow_id).unwrap().hop_cnt += hop_cnt;
                     }
                     None => match self.old_compressed_logs.get(&log.flow_id) {
                         Some(clog_old) => {
@@ -273,6 +292,13 @@ where
                                     ) + hop_cnt_var.get_variable(),
                                 },
                             );
+                            new_clogs.insert(
+                                log.flow_id,
+                                CompressedLog {
+                                    merkle_idx: clog_old.merkle_idx,
+                                    hop_cnt: clog_old.hop_cnt + hop_cnt,
+                                },
+                            );
                         }
                         None => {
                             modified_flows.insert(
@@ -280,6 +306,13 @@ where
                                 CompressedLog {
                                     merkle_idx: merkle_idx,
                                     hop_cnt: LinearCombination::zero() + hop_cnt_var.get_variable(),
+                                },
+                            );
+                            new_clogs.insert(
+                                log.flow_id,
+                                CompressedLog {
+                                    merkle_idx: merkle_idx,
+                                    hop_cnt: hop_cnt,
                                 },
                             );
                             merkle_idx += 1;
@@ -322,9 +355,12 @@ where
             )?;
         }
 
-        // Membership check for old compressed logs
-        for (flow_id, new_clog) in modified_flows.iter() {
-            let index = new_clog.merkle_idx;
+        // Membership check for compressed logs
+        let mut flow_ids = modified_flows.keys().collect::<Vec<_>>();
+        flow_ids.sort();
+        for flow_id in flow_ids.iter() {
+            let new_clog_lc = modified_flows.get(&flow_id).unwrap();
+            let index = new_clog_lc.merkle_idx;
             let index_scalar = E::Scalar::from(index as u64);
 
             let index_bits = idx_to_bits(HEIGHT, index_scalar);
@@ -351,7 +387,7 @@ where
                         _arity: PhantomData::<U1>,
                     };
                     assert!(
-                        siblings_path.verify(index_bits, &leaf, self.prev_tree.root),
+                        siblings_path.verify(index_bits.clone(), &leaf, self.prev_tree.root),
                         "compressed log {index} should verify"
                     );
 
@@ -379,24 +415,84 @@ where
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 
-                    let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-                        &mut cs.namespace(|| format!("valid {index}")),
-                        root_var.clone(),
-                        leaf_var,
-                        index_bits_var,
-                        siblings_var,
-                    )?);
+                    let is_valid =
+                        Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
+                            &mut cs.namespace(|| format!("valid {index}")),
+                            prev_root_var.clone(),
+                            leaf_var,
+                            index_bits_var.clone(),
+                            siblings_var,
+                        )?);
 
                     Boolean::enforce_equal(
                         cs.namespace(|| format!("enforce true {index}")),
                         &is_valid,
                         &Boolean::constant(true),
                     )?;
-                },
-                None => {},
+                }
+                None => {}
             }
 
             // Verify membership of new compressed log
+            let new_clog = new_clogs.get(&flow_id).unwrap();
+
+            let siblings_path = self.new_tree.get_siblings_path(index_bits.clone());
+
+            let leaf = Leaf {
+                val: vec![new_clog.hop_cnt],
+                _arity: PhantomData::<U1>,
+            };
+            assert!(
+                siblings_path.verify(index_bits.clone(), &leaf, self.new_tree.root),
+                "new compressed log {index} should verify"
+            );
+
+            let siblings_var = siblings_path
+                .siblings
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    AllocatedNum::alloc(
+                        cs.namespace(|| format!("index {index} new sibling {i}")),
+                        || Ok(s),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let new_lc = &new_clog_lc.hop_cnt;
+            let leaf_var = leaf
+                .val
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let leaf_var = AllocatedNum::alloc(
+                        cs.namespace(|| format!("index {index} new leaf val {i}")),
+                        || Ok(s),
+                    )
+                    .unwrap();
+                    cs.enforce(
+                        || format!("enforce leaf var {index}, val {i} == updated clog"),
+                        |lc| lc + new_lc,
+                        |lc| lc + CS::one(),
+                        |lc| lc + leaf_var.get_variable(),
+                    );
+                    leaf_var
+                })
+                .collect();
+
+            let is_valid = Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
+                &mut cs.namespace(|| format!("valid new {index}")),
+                new_root_var.clone(),
+                leaf_var,
+                index_bits_var.clone(),
+                siblings_var,
+            )?);
+
+            Boolean::enforce_equal(
+                cs.namespace(|| format!("enforce true new {index}")),
+                &is_valid,
+                &Boolean::constant(true),
+            )?;
         }
 
         Ok(vec![])

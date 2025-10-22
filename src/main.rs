@@ -27,8 +27,8 @@ fn main() {
     let mut rng = SmallRng::seed_from_u64(1);
     let raw_logs: Vec<_> = (0..1000)
         .map(|_| aggregation_circuit::Log {
-            flow_id: rng.random_range(0..=20),
-            hop_cnt: <E as Engine>::Scalar::from(rng.random::<u64>()),
+            flow_id: rng.random_range(0..=500),
+            hop_cnt: <E as Engine>::Scalar::from(rng.random_range(0..=50)),
         })
         .collect();
 

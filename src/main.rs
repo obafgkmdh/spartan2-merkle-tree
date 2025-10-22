@@ -38,11 +38,12 @@ fn main() {
             raw_logs, 20,
         );
 
-    let n_batches = circuit.raw_logs.len();
-    let root_span = info_span!("bench", HEIGHT, n_batches, BATCH_SIZE).entered();
+    let n_new_batches = circuit.raw_logs.len();
+    let n_clogs = circuit.old_compressed_logs.len();
+    let root_span = info_span!("bench", HEIGHT, n_new_batches, BATCH_SIZE, n_clogs).entered();
     info!(
-        "======= height={}, n_batches={}, batch_size={} =======",
-        HEIGHT, n_batches, BATCH_SIZE
+        "======= height={}, n_new_batches={}, batch_size={}, n_clogs={} =======",
+        HEIGHT, n_new_batches, BATCH_SIZE, n_clogs
     );
 
     // SETUP
@@ -74,8 +75,8 @@ fn main() {
 
     // Summary
     info!(
-        "SUMMARY n_inputs={}, setup={} ms, prep_prove={} ms, prove={} ms, verify={} ms",
-        n_batches, setup_ms, prep_ms, prove_ms, verify_ms
+        "SUMMARY n_new_batches={}, batch_size={}, setup={} ms, prep_prove={} ms, prove={} ms, verify={} ms",
+        n_new_batches, BATCH_SIZE, setup_ms, prep_ms, prove_ms, verify_ms
     );
     drop(root_span);
 }

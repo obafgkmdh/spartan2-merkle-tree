@@ -46,7 +46,6 @@ pub struct AggregationCircuit<
     pub raw_logs: Vec<[Log<Scalar>; BATCH_SIZE]>, // New raw logs from routers, batched
     pub hashes: Vec<Scalar>,                      // Hashes of batched logs
     pub old_compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
-    pub old_num_flows: usize,                                     // Old number of flow ids
     pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Previous tree
     pub new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,             // Updated tree
 }
@@ -125,8 +124,6 @@ where
 
         let prev_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
 
-        let old_num_flows = merkle_idx;
-
         // Compress the rest of the logs
         let mut compressed_logs = old_compressed_logs.clone();
         for log in raw_logs[new_idx..].into_iter() {
@@ -166,7 +163,6 @@ where
             raw_logs: batched_logs,
             hashes,
             old_compressed_logs,
-            old_num_flows,
             prev_tree,
             new_tree,
         }
@@ -232,7 +228,7 @@ where
 
         let mut modified_flows = HashMap::<i32, CompressedLog<LinearCombination<E::Scalar>>>::new();
         let mut new_clogs = HashMap::<i32, CompressedLog<E::Scalar>>::new();
-        let mut merkle_idx = self.old_num_flows;
+        let mut merkle_idx = self.old_compressed_logs.len();
 
         for (idx, batch) in self.raw_logs.iter().enumerate() {
             // Check that all the new raw logs hash into the public hash values

@@ -176,7 +176,7 @@ where
     U<BATCH_SIZE>: Arity<E::Scalar> + Sync + Send,
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
-        // Previous tree root is public, along with leaf hashes
+        // Previous and new tree roots are public, along with leaf hashes
         let mut public_values = vec![self.prev_tree.root, self.new_tree.root];
         public_values.extend(&self.hashes);
         Ok(public_values)
@@ -195,6 +195,7 @@ where
         cs: &mut CS,
         _: &[AllocatedNum<E::Scalar>], // shared variables, if any
     ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+        // Get previous tree root
         let prev_root_var =
             AllocatedNum::alloc(cs.namespace(|| format!("prev tree root")), || {
                 Ok(self.prev_tree.root)
@@ -211,6 +212,7 @@ where
             |lc| lc + prev_root_input.get_variable(),
         );
 
+        // Get new tree root
         let new_root_var = AllocatedNum::alloc(cs.namespace(|| format!("new tree root")), || {
             Ok(self.new_tree.root)
         })?;
@@ -231,24 +233,7 @@ where
         let mut merkle_idx = self.old_compressed_logs.len();
 
         for (idx, batch) in self.raw_logs.iter().enumerate() {
-            // Check that all the new raw logs hash into the public hash values
-            let hash_input = AllocatedNum::alloc_input(
-                cs.namespace(|| format!("public batch hash {idx}")),
-                || Ok(self.hashes[idx]),
-            )?;
-
-            let hash_var =
-                AllocatedNum::alloc(cs.namespace(|| format!("hash index {idx}")), || {
-                    Ok(self.hashes[idx])
-                })?;
-
-            cs.enforce(
-                || format!("enforce hash {idx} == hash input"),
-                |lc| lc + hash_var.get_variable(),
-                |lc| lc + CS::one(),
-                |lc| lc + hash_input.get_variable(),
-            );
-
+            // Allocate variables
             let mut batch_vars = Vec::new();
             for (i, log) in batch.iter().enumerate() {
                 let flow_id = E::Scalar::from_u128(log.flow_id as u128);
@@ -289,10 +274,8 @@ where
                             log.flow_id,
                             CompressedLog {
                                 merkle_idx: idx,
-                                hop_cnt: LinearCombination::from_coeff(
-                                    CS::one(),
-                                    old_hop_cnt,
-                                ) + hop_cnt_var.get_variable(),
+                                hop_cnt: LinearCombination::from_coeff(CS::one(), old_hop_cnt)
+                                    + hop_cnt_var.get_variable(),
                             },
                         );
                         new_clogs.insert(
@@ -318,6 +301,24 @@ where
 
                 batch_vars.push(batch_var);
             }
+
+            // Check that this batch of logs matches the public hash value
+            let hash_input = AllocatedNum::alloc_input(
+                cs.namespace(|| format!("public batch hash {idx}")),
+                || Ok(self.hashes[idx]),
+            )?;
+
+            let hash_var =
+                AllocatedNum::alloc(cs.namespace(|| format!("hash index {idx}")), || {
+                    Ok(self.hashes[idx])
+                })?;
+
+            cs.enforce(
+                || format!("enforce hash {idx} == hash input"),
+                |lc| lc + hash_var.get_variable(),
+                |lc| lc + CS::one(),
+                |lc| lc + hash_input.get_variable(),
+            );
 
             let log_hash_constants =
                 Sponge::<E::Scalar, U<BATCH_SIZE>>::api_constants(Strength::Standard);

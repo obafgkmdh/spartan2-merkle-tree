@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 use bellpepper_core::{
-    ConstraintSystem, SynthesisError,
+    ConstraintSystem, LinearCombination, SynthesisError,
     boolean::{AllocatedBit, Boolean},
     num::AllocatedNum,
 };
@@ -229,18 +229,40 @@ where
                 |lc| lc + hash_input.get_variable(),
             );
 
-            let batch_vars = batch
-                .iter()
-                .enumerate()
-                .map(|(i, log)| {
-                    let flow_id = E::Scalar::from_u128(log.flow_id as u128);
-                    let value = (flow_id * E::Scalar::from_u128(1 << 64)) + log.hop_cnt;
-                    AllocatedNum::alloc(
-                        cs.namespace(|| format!("batch index {idx}, log {i}")),
-                        || Ok(value),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut batch_vars = Vec::new();
+            for (i, log) in batch.iter().enumerate() {
+                let flow_id = E::Scalar::from_u128(log.flow_id as u128);
+                let hop_cnt = log.hop_cnt;
+
+                let flow_id_var = AllocatedNum::alloc(
+                    cs.namespace(|| format!("batch index {idx}, flow_id {i}")),
+                    || Ok(flow_id),
+                )
+                .unwrap();
+                let hop_cnt_var = AllocatedNum::alloc(
+                    cs.namespace(|| format!("batch index {idx}, hop_cnt {i}")),
+                    || Ok(hop_cnt),
+                )
+                .unwrap();
+                let batch_var = AllocatedNum::alloc(
+                    cs.namespace(|| format!("batch index {idx}, var {i}")),
+                    || Ok(flow_id * E::Scalar::from_u128(1 << 64) + hop_cnt),
+                )
+                .unwrap();
+
+                let lincomb = LinearCombination::from_coeff(
+                    flow_id_var.get_variable(),
+                    E::Scalar::from_u128(1 << 64),
+                ) + hop_cnt_var.get_variable();
+                cs.enforce(
+                    || format!("enforce batch index {idx}, var {i} == (flow_id << 64) + hop_cnt"),
+                    |lc| lc + &lincomb,
+                    |lc| lc + CS::one(),
+                    |lc| lc + batch_var.get_variable(),
+                );
+
+                batch_vars.push(batch_var);
+            }
 
             let log_hash_constants =
                 Sponge::<E::Scalar, U<BATCH_SIZE>>::api_constants(Strength::Standard);

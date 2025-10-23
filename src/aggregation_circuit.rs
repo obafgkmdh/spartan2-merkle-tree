@@ -176,7 +176,7 @@ where
     U<BATCH_SIZE>: Arity<E::Scalar> + Sync + Send,
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
-        // Previous and new tree roots are public, along with leaf hashes
+        // Previous and new tree roots are public, along with public batch hashes
         let mut public_values = vec![self.prev_tree.root, self.new_tree.root];
         public_values.extend(&self.hashes);
         Ok(public_values)
@@ -329,16 +329,12 @@ where
             )
             .unwrap();
 
-            let hash_is_equal = Boolean::from(AllocatedBit::alloc(
-                cs.namespace(|| format!("batch hash {idx} == hash {idx}")),
-                Some(hash_var.get_value() == hashed_batch.get_value()),
-            )?);
-
-            Boolean::enforce_equal(
-                cs.namespace(|| format!("enforce batch hash {idx}")),
-                &hash_is_equal,
-                &Boolean::constant(true),
-            )?;
+            cs.enforce(
+                || format!("enforce batch hash {idx} == hash {idx}"),
+                |lc| lc + hash_var.get_variable(),
+                |lc| lc + CS::one(),
+                |lc| lc + hashed_batch.get_variable(),
+            );
         }
 
         // Membership check for compressed logs

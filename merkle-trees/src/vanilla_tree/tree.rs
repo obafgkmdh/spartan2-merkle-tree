@@ -94,6 +94,11 @@ impl<F: PrimeField + PrimeFieldBits, const N: usize, AL: Arity<F>, AN: Arity<F>>
         let mut empty_hash = Leaf::<F, AL>::hash_leaf(&empty_leaf_val, &leaf_hash_params);
         let mut right_hash = empty_hash.clone();
         for level in 0..N {
+            // compute empty_hash for next level
+            let val = (empty_hash.clone(), empty_hash.clone());
+            empty_hash = hash(vec![empty_hash.clone(), empty_hash.clone()], &node_hash_params);
+            hash_db.insert(format!("{:?}", empty_hash.clone()), val);
+
             match left_hashes[level] {
                 Some(left_hash) => {
                     // combine left hash with right hash
@@ -106,21 +111,19 @@ impl<F: PrimeField + PrimeFieldBits, const N: usize, AL: Arity<F>, AN: Arity<F>>
                         },
                         None => {
                             left_hashes[level + 1] = Some(next_hash);
+                            // right hash becomes the empty hash for the next level
+                            right_hash = empty_hash.clone();
                         }
                     }
                 },
                 None => {
-                    // right hash becomes the empty hash for this level
+                    // right hash becomes the empty hash for the next level
                     right_hash = empty_hash.clone();
                 },
             }
-            // compute empty_hash for next level
-            let val = (empty_hash.clone(), empty_hash.clone());
-            empty_hash = hash(vec![empty_hash.clone(), empty_hash.clone()], &node_hash_params);
-            hash_db.insert(format!("{:?}", empty_hash.clone()), val);
         }
         Self {
-            root: left_hashes[N].unwrap(),
+            root: left_hashes[N].unwrap_or(empty_hash),
             hash_db: hash_db,
             leaf_hash_params: leaf_hash_params,
             node_hash_params: node_hash_params,

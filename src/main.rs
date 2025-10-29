@@ -26,17 +26,22 @@ fn main() {
 
     let mut rng = SmallRng::seed_from_u64(1);
     let raw_logs: Vec<_> = (0..1000)
-        .map(|_| aggregation_circuit::Log {
+        .map(|_| aggregation_circuit::Log::<u32> {
             flow_id: rng.random_range(0..=500),
-            hop_cnt: <E as Engine>::Scalar::from(rng.random_range(0..=50)),
+            src: rng.random::<u32>(),
+            dst: rng.random::<u32>(),
+            packet_size: rng.random_range(0..=65000),
+            hop_cnt: rng.random_range(0..=50),
         })
         .collect();
 
     // Create circuit
-    let circuit =
-        aggregation_circuit::AggregationCircuit::<<E as Engine>::Scalar, HEIGHT, BATCH_SIZE>::new(
-            raw_logs, 20,
-        );
+    let circuit = aggregation_circuit::AggregationCircuit::<
+        <E as Engine>::Scalar,
+        _,
+        HEIGHT,
+        BATCH_SIZE,
+    >::new(raw_logs, 20);
 
     let n_new_batches = circuit.raw_logs.len();
     let n_clogs = circuit.old_compressed_logs.len();

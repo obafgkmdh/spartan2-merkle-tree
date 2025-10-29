@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+use bellpepper::gadgets::boolean::field_into_allocated_bits_le;
 use bellpepper_core::{
     ConstraintSystem, LinearCombination, SynthesisError,
     boolean::{AllocatedBit, Boolean},
@@ -19,13 +20,87 @@ use neptune::Strength;
 use neptune::poseidon::Arity;
 use neptune::sponge::vanilla::{Sponge, SpongeTrait};
 
+use std::cmp::Ord;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::hash::Hash;
 
 #[derive(Clone, Debug)]
-pub struct Log<Scalar> {
-    pub flow_id: i32,
-    pub hop_cnt: Scalar,
+pub struct Log<T> {
+    pub flow_id: T,
+    pub src: T,
+    pub dst: T,
+    pub packet_size: T,
+    pub hop_cnt: T,
+}
+
+impl<T> Log<T> {
+    fn get_offsets(&self) -> Vec<(&T, usize, usize)> {
+        // This defines the packing of Log fields into a Scalar. Each field takes up 32 bits in the
+        // resulting Scalar.
+        const FIELD_SIZE: usize = 32;
+        let mut offsets = vec![];
+        let mut offset = 0;
+        for field in vec![
+            &self.flow_id,
+            &self.hop_cnt,
+            &self.src,
+            &self.dst,
+            &self.packet_size,
+        ] {
+            offsets.push((field, offset, FIELD_SIZE));
+            offset += FIELD_SIZE;
+        }
+        offsets
+    }
+}
+
+impl<T: Copy> Log<T>
+where
+    T: Into<u64>,
+{
+    fn to_scalar_log<Scalar: PrimeField + PrimeFieldBits>(&self) -> Log<Scalar> {
+        Log {
+            flow_id: Scalar::from(self.flow_id.into()),
+            src: Scalar::from(self.src.into()),
+            dst: Scalar::from(self.dst.into()),
+            packet_size: Scalar::from(self.packet_size.into()),
+            hop_cnt: Scalar::from(self.hop_cnt.into()),
+        }
+    }
+}
+
+impl<Scalar: PrimeField + PrimeFieldBits> Log<Scalar> {
+    fn pack(&self) -> Scalar {
+        // Combine fields into a single Scalar.
+        let mut packed = Scalar::ZERO;
+        let TWO = Scalar::from(2);
+        for (&field, offset, _nbits) in self.get_offsets() {
+            packed += field * TWO.pow(std::slice::from_ref(&(offset as u64)));
+        }
+        packed
+    }
+
+    fn to_allocated<CS>(&self, mut cs: CS) -> Log<AllocatedNum<Scalar>>
+    where
+        CS: ConstraintSystem<Scalar>,
+    {
+        let flow_id_var =
+            AllocatedNum::alloc(cs.namespace(|| "flow_id"), || Ok(self.flow_id)).unwrap();
+        let src_var = AllocatedNum::alloc(cs.namespace(|| "src"), || Ok(self.src)).unwrap();
+        let dst_var = AllocatedNum::alloc(cs.namespace(|| "dst"), || Ok(self.dst)).unwrap();
+        let packet_size_var =
+            AllocatedNum::alloc(cs.namespace(|| "packet_size"), || Ok(self.packet_size)).unwrap();
+        let hop_cnt_var =
+            AllocatedNum::alloc(cs.namespace(|| "hop_cnt"), || Ok(self.hop_cnt)).unwrap();
+        Log {
+            flow_id: flow_id_var,
+            src: src_var,
+            dst: dst_var,
+            packet_size: packet_size_var,
+            hop_cnt: hop_cnt_var,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -37,26 +112,29 @@ pub struct CompressedLog<Scalar> {
 #[derive(Clone, Debug)]
 pub struct AggregationCircuit<
     Scalar: PrimeField + PrimeFieldBits,
+    K,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
 > where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<Scalar>,
+    K: Eq + Hash,
 {
-    pub raw_logs: Vec<[Log<Scalar>; BATCH_SIZE]>, // New raw logs from routers, batched
-    pub hashes: Vec<Scalar>,                      // Hashes of batched logs
-    pub old_compressed_logs: HashMap<i32, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
-    pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,            // Previous tree
-    pub new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,             // Updated tree
+    pub raw_logs: Vec<[Log<K>; BATCH_SIZE]>, // New raw logs from routers, batched
+    pub hashes: Vec<Scalar>,                 // Hashes of batched logs
+    pub old_compressed_logs: HashMap<K, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
+    pub prev_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,          // Previous tree
+    pub new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,           // Updated tree
 }
 
-impl<Scalar: PrimeField + PrimeFieldBits, const HEIGHT: usize, const BATCH_SIZE: usize>
-    AggregationCircuit<Scalar, HEIGHT, BATCH_SIZE>
+impl<Scalar: PrimeField + PrimeFieldBits, K, const HEIGHT: usize, const BATCH_SIZE: usize>
+    AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
 where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<Scalar>,
+    K: Eq + Hash + Copy + Into<u64>,
 {
-    pub fn new(raw_logs: Vec<Log<Scalar>>, num_new_batches: usize) -> Self {
+    pub fn new(raw_logs: Vec<Log<K>>, num_new_batches: usize) -> Self {
         // Split the new logs into batches
         let new_idx = raw_logs.len() - (BATCH_SIZE * num_new_batches);
         let (batched_logs, rem) = raw_logs[new_idx..].as_chunks::<BATCH_SIZE>();
@@ -70,20 +148,12 @@ where
         let batched_logs = batched_logs.to_vec();
 
         // Compute hashes of batched logs
+        // TODO: set arity to 2
         let log_hash_constants = Sponge::<Scalar, U<BATCH_SIZE>>::api_constants(Strength::Standard);
         let hashes = batched_logs
             .iter()
             .map(|batch| {
-                let logs = batch
-                    .iter()
-                    .map(|log| {
-                        // Combine fields into a single Scalar. This is hacky and possibly
-                        // unsound (since there's no size checks).
-                        // TODO: Make this a hash call or just flatten all the fields
-                        let flow_id = Scalar::from_u128(log.flow_id as u128);
-                        (flow_id * Scalar::from_u128(1 << 64)) + log.hop_cnt
-                    })
-                    .collect();
+                let logs = batch.iter().map(|log| log.to_scalar_log().pack()).collect();
                 hash(logs, &log_hash_constants)
             })
             .collect();
@@ -92,14 +162,15 @@ where
         let mut old_compressed_logs: HashMap<_, CompressedLog<_>> = HashMap::new();
         let mut merkle_idx = 0;
         for log in raw_logs[..new_idx].into_iter() {
+            let scalar_log = log.to_scalar_log();
             match old_compressed_logs.entry(log.flow_id) {
                 Entry::Occupied(clog) => {
-                    clog.into_mut().hop_cnt += log.hop_cnt;
+                    clog.into_mut().hop_cnt += scalar_log.hop_cnt;
                 }
                 Entry::Vacant(entry) => {
                     let clog = CompressedLog {
                         merkle_idx,
-                        hop_cnt: log.hop_cnt,
+                        hop_cnt: scalar_log.hop_cnt,
                     };
                     entry.insert(clog);
                     merkle_idx += 1;
@@ -127,14 +198,15 @@ where
         // Compress the rest of the logs
         let mut compressed_logs = old_compressed_logs.clone();
         for log in raw_logs[new_idx..].into_iter() {
+            let scalar_log = log.to_scalar_log();
             match compressed_logs.entry(log.flow_id) {
                 Entry::Occupied(clog) => {
-                    clog.into_mut().hop_cnt += log.hop_cnt;
+                    clog.into_mut().hop_cnt += scalar_log.hop_cnt;
                 }
                 Entry::Vacant(entry) => {
                     let clog = CompressedLog {
                         merkle_idx,
-                        hop_cnt: log.hop_cnt,
+                        hop_cnt: scalar_log.hop_cnt,
                     };
                     entry.insert(clog);
                     merkle_idx += 1;
@@ -169,11 +241,12 @@ where
     }
 }
 
-impl<E: Engine, const HEIGHT: usize, const BATCH_SIZE: usize> SpartanCircuit<E>
-    for AggregationCircuit<E::Scalar, HEIGHT, BATCH_SIZE>
+impl<E: Engine, K, const HEIGHT: usize, const BATCH_SIZE: usize> SpartanCircuit<E>
+    for AggregationCircuit<E::Scalar, K, HEIGHT, BATCH_SIZE>
 where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<E::Scalar> + Sync + Send,
+    K: Ord + Hash + Copy + Into<u64> + Sync + Send,
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
         // Previous and new tree roots are public, along with public batch hashes
@@ -195,6 +268,13 @@ where
         cs: &mut CS,
         _: &[AllocatedNum<E::Scalar>], // shared variables, if any
     ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
+        // Precompute powers of 2
+        let mut powers_of_two = vec![E::Scalar::ONE];
+        let TWO = E::Scalar::from(2);
+        for i in 0..(E::Scalar::NUM_BITS - 1) {
+            powers_of_two.push(powers_of_two[i as usize] * TWO);
+        }
+
         // Get previous tree root
         let prev_root_var =
             AllocatedNum::alloc(cs.namespace(|| format!("prev tree root")), || {
@@ -228,38 +308,30 @@ where
             |lc| lc + new_root_input.get_variable(),
         );
 
-        let mut modified_flows = HashMap::<i32, CompressedLog<LinearCombination<E::Scalar>>>::new();
-        let mut new_clogs = HashMap::<i32, CompressedLog<E::Scalar>>::new();
+        let mut modified_flows = HashMap::<K, CompressedLog<LinearCombination<E::Scalar>>>::new();
+        let mut new_clogs = HashMap::<K, CompressedLog<E::Scalar>>::new();
         let mut merkle_idx = self.old_compressed_logs.len();
 
         for (idx, batch) in self.raw_logs.iter().enumerate() {
             // Allocate variables
             let mut batch_vars = Vec::new();
             for (i, log) in batch.iter().enumerate() {
-                let flow_id = E::Scalar::from_u128(log.flow_id as u128);
-                let hop_cnt = log.hop_cnt;
+                let scalar_log = log.to_scalar_log();
+                let packed = scalar_log.pack();
 
-                let flow_id_var = AllocatedNum::alloc(
-                    cs.namespace(|| format!("batch index {idx}, flow_id {i}")),
-                    || Ok(flow_id),
-                )
-                .unwrap();
-                let hop_cnt_var = AllocatedNum::alloc(
-                    cs.namespace(|| format!("batch index {idx}, hop_cnt {i}")),
-                    || Ok(hop_cnt),
-                )
-                .unwrap();
+                let allocated_log =
+                    scalar_log.to_allocated(cs.namespace(|| format!("allocated log {idx}-{i}")));
                 let batch_var = AllocatedNum::alloc(
                     cs.namespace(|| format!("batch index {idx}, var {i}")),
-                    || Ok(flow_id * E::Scalar::from_u128(1 << 64) + hop_cnt),
+                    || Ok(packed),
                 )
                 .unwrap();
 
                 // Keep track of new/modified flows
                 match modified_flows.get_mut(&log.flow_id) {
                     Some(clog) => {
-                        clog.hop_cnt = clog.hop_cnt.clone() + hop_cnt_var.get_variable();
-                        new_clogs.get_mut(&log.flow_id).unwrap().hop_cnt += hop_cnt;
+                        clog.hop_cnt = clog.hop_cnt.clone() + allocated_log.hop_cnt.get_variable();
+                        new_clogs.get_mut(&log.flow_id).unwrap().hop_cnt += scalar_log.hop_cnt;
                     }
                     None => {
                         let (idx, old_hop_cnt) = match self.old_compressed_logs.get(&log.flow_id) {
@@ -275,25 +347,43 @@ where
                             CompressedLog {
                                 merkle_idx: idx,
                                 hop_cnt: LinearCombination::from_coeff(CS::one(), old_hop_cnt)
-                                    + hop_cnt_var.get_variable(),
+                                    + allocated_log.hop_cnt.get_variable(),
                             },
                         );
                         new_clogs.insert(
                             log.flow_id,
                             CompressedLog {
                                 merkle_idx: idx,
-                                hop_cnt: old_hop_cnt + hop_cnt,
+                                hop_cnt: old_hop_cnt + scalar_log.hop_cnt,
                             },
                         );
                     }
                 };
 
-                let lincomb = LinearCombination::from_coeff(
-                    flow_id_var.get_variable(),
-                    E::Scalar::from_u128(1 << 64),
-                ) + hop_cnt_var.get_variable();
+                // This creates as many variables as the field size in bits, but we only use some
+                // of them. Not sure if the unused ones get eliminated
+                let packed_bits = field_into_allocated_bits_le(
+                    cs.namespace(|| format!("bit decomposition {idx} {i}")),
+                    Some(packed),
+                )?;
+                let mut lincomb = LinearCombination::zero();
+                for (field, offset, nbits) in allocated_log.get_offsets() {
+                    let bit_sum = packed_bits[offset..offset + nbits]
+                        .iter()
+                        .enumerate()
+                        .fold(LinearCombination::zero(), |acc, (i, x)| {
+                            acc + (powers_of_two[i], x.get_variable())
+                        });
+                    cs.enforce(
+                        || format!("enforce bit sum {idx}, var {i}, offset {offset} == log field"),
+                        |lc| lc + &bit_sum,
+                        |lc| lc + CS::one(),
+                        |lc| lc + field.get_variable(),
+                    );
+                    lincomb = lincomb + (powers_of_two[offset], field.get_variable())
+                }
                 cs.enforce(
-                    || format!("enforce batch index {idx}, var {i} == (flow_id << 64) + hop_cnt"),
+                    || format!("enforce batch index {idx}, var {i} == packed log"),
                     |lc| lc + &lincomb,
                     |lc| lc + CS::one(),
                     |lc| lc + batch_var.get_variable(),

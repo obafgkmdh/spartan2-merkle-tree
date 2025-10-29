@@ -10,7 +10,7 @@ use ff::{Field, PrimeField, PrimeFieldBits};
 use spartan2::traits::{Engine, circuit::SpartanCircuit};
 use std::marker::PhantomData;
 
-use generic_array::typenum::{Const, ToUInt, U, U1, U2};
+use generic_array::typenum::{U1, U2};
 use merkle_trees::hash::circuit::hash_circuit;
 use merkle_trees::hash::vanilla::hash;
 use merkle_trees::vanilla_tree;
@@ -18,7 +18,6 @@ use merkle_trees::vanilla_tree::circuit::path_verify_circuit;
 use merkle_trees::vanilla_tree::tree::{Leaf, MerkleTree, idx_to_bits};
 
 use neptune::Strength;
-use neptune::poseidon::Arity;
 use neptune::sponge::vanilla::{Sponge, SpongeTrait};
 
 use std::cmp::Ord;
@@ -95,10 +94,7 @@ pub struct AggregationCircuit<
     K: Eq + Hash,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
-> where
-    Const<BATCH_SIZE>: ToUInt,
-    U<BATCH_SIZE>: Arity<Scalar>,
-{
+> {
     pub raw_logs: Vec<[Log<K>; BATCH_SIZE]>, // New raw logs from routers, batched
     pub hashes: Vec<Scalar>,                 // Hashes of batched logs
     pub old_compressed_logs: HashMap<K, CompressedLog<Scalar>>, // Old compressed logs, one per flow id
@@ -112,9 +108,6 @@ impl<
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
 > AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
-where
-    Const<BATCH_SIZE>: ToUInt,
-    U<BATCH_SIZE>: Arity<Scalar>,
 {
     pub fn new(raw_logs: Vec<Log<K>>, num_new_batches: usize) -> Self {
         // Split the new logs into batches
@@ -130,8 +123,7 @@ where
         let batched_logs = batched_logs.to_vec();
 
         // Compute hashes of batched logs
-        // TODO: set arity to 2
-        let log_hash_constants = Sponge::<Scalar, U<BATCH_SIZE>>::api_constants(Strength::Standard);
+        let log_hash_constants = Sponge::<Scalar, U2>::api_constants(Strength::Standard);
         let hashes = batched_logs
             .iter()
             .map(|batch| {
@@ -229,9 +221,6 @@ impl<
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
 > SpartanCircuit<E> for AggregationCircuit<E::Scalar, K, HEIGHT, BATCH_SIZE>
-where
-    Const<BATCH_SIZE>: ToUInt,
-    U<BATCH_SIZE>: Arity<E::Scalar> + Sync + Send,
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
         // Previous and new tree roots are public, along with public batch hashes
@@ -372,8 +361,7 @@ where
                 |lc| lc + hash_input.get_variable(),
             );
 
-            let log_hash_constants =
-                Sponge::<E::Scalar, U<BATCH_SIZE>>::api_constants(Strength::Standard);
+            let log_hash_constants = Sponge::<E::Scalar, U2>::api_constants(Strength::Standard);
             let hashed_batch = hash_circuit(
                 &mut cs.namespace(|| format!("batch hash {idx}")),
                 batch_vars,

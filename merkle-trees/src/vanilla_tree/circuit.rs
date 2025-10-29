@@ -5,6 +5,48 @@ use ff::{PrimeField, PrimeFieldBits};
 use neptune::sponge::vanilla::{Sponge, SpongeTrait};
 use neptune::{Arity, Strength};
 
+pub fn path_computed_root<
+    F: PrimeField + PrimeFieldBits,
+    AL: Arity<F>,
+    AN: Arity<F>,
+    const N: usize,
+    CS: ConstraintSystem<F>,
+>(
+    cs: &mut CS,
+    val_var: Vec<AllocatedNum<F>>,
+    mut idx_var: Vec<AllocatedBit>,
+    siblings_var: Vec<AllocatedNum<F>>,
+) -> Result<AllocatedNum<F>, SynthesisError> {
+    let node_hash_params = Sponge::<F, AN>::api_constants(Strength::Standard);
+    let leaf_hash_params = Sponge::<F, AL>::api_constants(Strength::Standard);
+    let mut cur_hash_var = hash_circuit(
+        &mut cs.namespace(|| "hash num -1 :"),
+        val_var,
+        &leaf_hash_params,
+    )
+    .unwrap();
+
+    idx_var.reverse(); // Going from leaf to root
+
+    for (i, sibling) in siblings_var.clone().into_iter().rev().enumerate() {
+        let (lc, rc) = AllocatedNum::conditionally_reverse(
+            &mut cs.namespace(|| format!("rev num {} :", i)),
+            &cur_hash_var,
+            &sibling,
+            &Boolean::from(idx_var[i].clone()),
+        )
+        .unwrap();
+        cur_hash_var = hash_circuit(
+            &mut cs.namespace(|| format!("hash num {} :", i)),
+            vec![lc, rc],
+            &node_hash_params,
+        )
+        .unwrap();
+    }
+
+    Ok(cur_hash_var)
+}
+
 pub fn path_verify_circuit<
     F: PrimeField + PrimeFieldBits,
     AL: Arity<F>,

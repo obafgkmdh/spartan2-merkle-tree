@@ -14,7 +14,7 @@ use generic_array::typenum::{U1, U2};
 use merkle_trees::hash::circuit::hash_circuit;
 use merkle_trees::hash::vanilla::hash;
 use merkle_trees::vanilla_tree;
-use merkle_trees::vanilla_tree::circuit::path_verify_circuit;
+use merkle_trees::vanilla_tree::circuit::path_computed_root;
 use merkle_trees::vanilla_tree::tree::{Leaf, MerkleTree, idx_to_bits};
 
 use neptune::Strength;
@@ -363,32 +363,28 @@ impl<
                         clog.hop_cnt += scalar_log.hop_cnt;
                         (old_clog, (*clog).clone())
                     }
-                    Entry::Vacant(entry) => {
-                        match self.old_compressed_logs.get(&log.flow_id) {
-                            Some(clog_old) => {
-                                let old_clog = Some((*clog_old).clone());
-                                let mut new_clog = (*clog_old).clone();
-                                new_clog.hop_cnt = clog_old.hop_cnt + scalar_log.hop_cnt;
-                                entry.insert(new_clog.clone());
-                                (old_clog, new_clog)
-                            },
-                            None => {
-                                let new_clog = CompressedLog::from_idx_log(merkle_idx, &scalar_log);
-                                entry.insert(new_clog.clone());
-                                merkle_idx += 1;
-                                (None, new_clog)
-                            }
+                    Entry::Vacant(entry) => match self.old_compressed_logs.get(&log.flow_id) {
+                        Some(clog_old) => {
+                            let old_clog = Some((*clog_old).clone());
+                            let mut new_clog = (*clog_old).clone();
+                            new_clog.hop_cnt = clog_old.hop_cnt + scalar_log.hop_cnt;
+                            entry.insert(new_clog.clone());
+                            (old_clog, new_clog)
                         }
-                    }
+                        None => {
+                            let new_clog = CompressedLog::from_idx_log(merkle_idx, &scalar_log);
+                            entry.insert(new_clog.clone());
+                            merkle_idx += 1;
+                            (None, new_clog)
+                        }
+                    },
                 };
 
                 let old_leaf = match old_clog {
                     Some(clog) => clog.to_leaf(),
                     None => vanilla_tree::tree::Leaf::default(),
                 };
-                let index_scalar = E::Scalar::from(new_clog.merkle_idx as u64);
-
-                let index_bits = idx_to_bits(HEIGHT, index_scalar);
+                let index_bits = idx_to_bits(HEIGHT, E::Scalar::from(new_clog.merkle_idx as u64));
 
                 let index_bits_var = index_bits
                     .clone()
@@ -402,13 +398,7 @@ impl<
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Verify membership of old compressed log
                 let siblings_path = cur_tree.get_siblings_path(index_bits.clone());
-                assert!(
-                    siblings_path.verify(index_bits.clone(), &old_leaf, cur_tree.root),
-                    "log {batch_idx}-{log_idx}: old compressed log should verify"
-                );
-
                 let siblings_var = siblings_path
                     .siblings
                     .clone()
@@ -422,8 +412,11 @@ impl<
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
+                // Extract old hop count from bit decomposition
                 let old_unpacked_bits: Vec<_> = field_into_allocated_bits_le(
-                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: old clog bit decomposition")),
+                    cs.namespace(|| {
+                        format!("log {batch_idx}-{log_idx}: old clog bit decomposition")
+                    }),
                     Some(old_leaf.val[0]),
                 )?
                 .iter()
@@ -435,42 +428,44 @@ impl<
                     &old_unpacked_bits,
                 )?;
 
-                // Extract old hop count from bit decomposition
                 let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
                 let old_hop_cnt_var = pack_bits(
                     cs.namespace(|| format!("log {batch_idx}-{log_idx}: old clog hop_cnt")),
                     &old_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
                 )?;
 
-                // TODO: we can save a variable here by having the circuit return the root instead
-                // of a boolean
-                let is_valid_old =
-                    Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-                        &mut cs.namespace(|| format!("valid old {batch_idx}-{log_idx}")),
-                        merkle_roots_inputs[root_idx].clone(),
-                        vec![old_packed_clog_var],
-                        index_bits_var.clone(),
-                        siblings_var.clone(),
-                    )?);
-                Boolean::enforce_equal(
-                    cs.namespace(|| format!("enforce true old {batch_idx}-{log_idx}")),
-                    &is_valid_old,
-                    &Boolean::constant(true),
+                // Verify membership of old compressed log
+                assert!(
+                    siblings_path.verify(index_bits.clone(), &old_leaf, cur_tree.root),
+                    "log {batch_idx}-{log_idx}: old compressed log should verify"
+                );
+                let old_computed_root_var = path_computed_root::<E::Scalar, U1, U2, HEIGHT, _>(
+                    &mut cs.namespace(|| format!("valid old {batch_idx}-{log_idx}")),
+                    vec![old_packed_clog_var],
+                    index_bits_var.clone(),
+                    siblings_var.clone(),
                 )?;
+                cs.enforce(
+                    || {
+                        format!(
+                            "log {batch_idx}-{log_idx}: enforce old computed root == public root"
+                        )
+                    },
+                    |lc| lc + merkle_roots_inputs[root_idx].get_variable(),
+                    |lc| lc + CS::one(),
+                    |lc| lc + old_computed_root_var.get_variable(),
+                );
 
                 // Update cur_tree by inserting new log
                 let new_leaf = new_clog.to_leaf();
                 cur_tree.insert(index_bits.clone(), &new_leaf);
                 root_idx += 1;
 
-                // Verify new leaf exists in next tree
-                assert!(
-                    siblings_path.verify(index_bits.clone(), &new_leaf, cur_tree.root),
-                    "log {batch_idx}-{log_idx}: new compressed log should verify"
-                );
-
+                // Extract new hop count from bit decomposition
                 let new_unpacked_bits: Vec<_> = field_into_allocated_bits_le(
-                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: new clog bit decomposition")),
+                    cs.namespace(|| {
+                        format!("log {batch_idx}-{log_idx}: new clog bit decomposition")
+                    }),
                     Some(new_clog.pack()),
                 )?
                 .iter()
@@ -482,26 +477,33 @@ impl<
                     &new_unpacked_bits,
                 )?;
 
-                // Extract old hop count from bit decomposition
                 let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
                 let new_hop_cnt_var = pack_bits(
                     cs.namespace(|| format!("log {batch_idx}-{log_idx}: new clog hop_cnt")),
                     &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
                 )?;
 
-                let is_valid_new =
-                    Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-                        &mut cs.namespace(|| format!("valid new {batch_idx}-{log_idx}")),
-                        merkle_roots_inputs[root_idx].clone(),
-                        vec![new_packed_clog_var],
-                        index_bits_var.clone(),
-                        siblings_var,
-                    )?);
-                Boolean::enforce_equal(
-                    cs.namespace(|| format!("enforce true new {batch_idx}-{log_idx}")),
-                    &is_valid_new,
-                    &Boolean::constant(true),
+                // Verify membership of new compressed log
+                assert!(
+                    siblings_path.verify(index_bits.clone(), &new_leaf, cur_tree.root),
+                    "log {batch_idx}-{log_idx}: new compressed log should verify"
+                );
+                let new_computed_root_var = path_computed_root::<E::Scalar, U1, U2, HEIGHT, _>(
+                    &mut cs.namespace(|| format!("valid new {batch_idx}-{log_idx}")),
+                    vec![new_packed_clog_var],
+                    index_bits_var.clone(),
+                    siblings_var.clone(),
                 )?;
+                cs.enforce(
+                    || {
+                        format!(
+                            "log {batch_idx}-{log_idx}: enforce new computed root == public root"
+                        )
+                    },
+                    |lc| lc + merkle_roots_inputs[root_idx].get_variable(),
+                    |lc| lc + CS::one(),
+                    |lc| lc + new_computed_root_var.get_variable(),
+                );
 
                 // Verify that new leaf is related to the old leaf
                 cs.enforce(

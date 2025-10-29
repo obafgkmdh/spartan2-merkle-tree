@@ -41,7 +41,7 @@ fn main() {
         _,
         HEIGHT,
         BATCH_SIZE,
-    >::new(raw_logs, 20);
+    >::new(raw_logs, 10);
 
     let n_new_batches = circuit.raw_logs.len();
     let n_clogs = circuit.old_compressed_logs.len();

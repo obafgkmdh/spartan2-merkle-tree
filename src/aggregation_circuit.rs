@@ -48,6 +48,7 @@ const LOG_OFFSETS: Log<(usize, usize)> = Log {
 
 impl<T> Log<T> {
     fn fields(&self) -> Vec<&T> {
+        // List of all fields that are hashed
         vec![
             &self.flow_id,
             &self.src,
@@ -252,13 +253,6 @@ where
         cs: &mut CS,
         _: &[AllocatedNum<E::Scalar>], // shared variables, if any
     ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
-        // Precompute powers of 2
-        let mut powers_of_two = vec![E::Scalar::ONE];
-        let TWO = E::Scalar::from(2);
-        for i in 0..(E::Scalar::NUM_BITS - 1) {
-            powers_of_two.push(powers_of_two[i as usize] * TWO);
-        }
-
         // Get previous tree root
         let prev_root_var =
             AllocatedNum::alloc(cs.namespace(|| format!("prev tree root")), || {

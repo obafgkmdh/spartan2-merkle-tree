@@ -55,10 +55,7 @@ impl<T> Log<T> {
     }
 }
 
-impl<T: Copy> Log<T>
-where
-    T: Into<u64>,
-{
+impl<T: Copy + Into<u64>> Log<T> {
     fn to_scalar_log<Scalar: PrimeField + PrimeFieldBits>(&self) -> Log<Scalar> {
         Log {
             flow_id: Scalar::from(self.flow_id.into()),
@@ -112,13 +109,12 @@ pub struct CompressedLog<Scalar> {
 #[derive(Clone, Debug)]
 pub struct AggregationCircuit<
     Scalar: PrimeField + PrimeFieldBits,
-    K,
+    K: Eq + Hash,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
 > where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<Scalar>,
-    K: Eq + Hash,
 {
     pub raw_logs: Vec<[Log<K>; BATCH_SIZE]>, // New raw logs from routers, batched
     pub hashes: Vec<Scalar>,                 // Hashes of batched logs
@@ -127,12 +123,15 @@ pub struct AggregationCircuit<
     pub new_tree: MerkleTree<Scalar, HEIGHT, U1, U2>,           // Updated tree
 }
 
-impl<Scalar: PrimeField + PrimeFieldBits, K, const HEIGHT: usize, const BATCH_SIZE: usize>
-    AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
+impl<
+    Scalar: PrimeField + PrimeFieldBits,
+    K: Eq + Hash + Copy + Into<u64>,
+    const HEIGHT: usize,
+    const BATCH_SIZE: usize,
+> AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
 where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<Scalar>,
-    K: Eq + Hash + Copy + Into<u64>,
 {
     pub fn new(raw_logs: Vec<Log<K>>, num_new_batches: usize) -> Self {
         // Split the new logs into batches
@@ -241,12 +240,15 @@ where
     }
 }
 
-impl<E: Engine, K, const HEIGHT: usize, const BATCH_SIZE: usize> SpartanCircuit<E>
-    for AggregationCircuit<E::Scalar, K, HEIGHT, BATCH_SIZE>
+impl<
+    E: Engine,
+    K: Ord + Hash + Copy + Into<u64> + Sync + Send,
+    const HEIGHT: usize,
+    const BATCH_SIZE: usize,
+> SpartanCircuit<E> for AggregationCircuit<E::Scalar, K, HEIGHT, BATCH_SIZE>
 where
     Const<BATCH_SIZE>: ToUInt,
     U<BATCH_SIZE>: Arity<E::Scalar> + Sync + Send,
-    K: Ord + Hash + Copy + Into<u64> + Sync + Send,
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
         // Previous and new tree roots are public, along with public batch hashes
@@ -308,8 +310,8 @@ where
             |lc| lc + new_root_input.get_variable(),
         );
 
-        let mut modified_flows = HashMap::<K, CompressedLog<LinearCombination<E::Scalar>>>::new();
-        let mut new_clogs = HashMap::<K, CompressedLog<E::Scalar>>::new();
+        let mut modified_flows = HashMap::<_, CompressedLog<LinearCombination<_>>>::new();
+        let mut new_clogs = HashMap::<_, CompressedLog<_>>::new();
         let mut merkle_idx = self.old_compressed_logs.len();
 
         for (idx, batch) in self.raw_logs.iter().enumerate() {
@@ -366,7 +368,7 @@ where
                     cs.namespace(|| format!("bit decomposition {idx} {i}")),
                     Some(packed),
                 )?;
-                let mut lincomb = LinearCombination::zero();
+                let mut batch_lincomb = LinearCombination::zero();
                 for (field, offset, nbits) in allocated_log.get_offsets() {
                     let bit_sum = packed_bits[offset..offset + nbits]
                         .iter()
@@ -380,11 +382,11 @@ where
                         |lc| lc + CS::one(),
                         |lc| lc + field.get_variable(),
                     );
-                    lincomb = lincomb + (powers_of_two[offset], field.get_variable())
+                    batch_lincomb = batch_lincomb + (powers_of_two[offset], field.get_variable())
                 }
                 cs.enforce(
                     || format!("enforce batch index {idx}, var {i} == packed log"),
-                    |lc| lc + &lincomb,
+                    |lc| lc + &batch_lincomb,
                     |lc| lc + CS::one(),
                     |lc| lc + batch_var.get_variable(),
                 );

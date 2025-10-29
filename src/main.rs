@@ -26,10 +26,12 @@ fn main() {
 
     let mut rng = SmallRng::seed_from_u64(1);
     let raw_logs: Vec<_> = (0..1000)
-        .map(|_| aggregation_circuit::Log::<u32> {
+        .map(|id| aggregation_circuit::Log::<u32> {
+            id: id,
             flow_id: rng.random_range(0..=500),
             src: rng.random::<u32>(),
             dst: rng.random::<u32>(),
+            pred: rng.random::<u32>(),
             packet_size: rng.random_range(0..=65000),
             hop_cnt: rng.random_range(0..=50),
         })

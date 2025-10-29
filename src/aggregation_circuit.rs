@@ -35,14 +35,14 @@ pub struct Log<T> {
     pub hop_cnt: T,
 }
 
-const FIELD_SIZE: usize = 32;
+const ENTRY_SIZE: usize = 32;
 const LOG_OFFSETS: Log<(usize, usize)> = Log {
     // This defines the packing of Log fields into a Scalar. Each field takes up 32 bits in the resulting Scalar.
-    flow_id: (FIELD_SIZE * 0, FIELD_SIZE),
-    src: (FIELD_SIZE * 1, FIELD_SIZE),
-    dst: (FIELD_SIZE * 2, FIELD_SIZE),
-    packet_size: (FIELD_SIZE * 3, FIELD_SIZE),
-    hop_cnt: (FIELD_SIZE * 4, FIELD_SIZE),
+    flow_id: (ENTRY_SIZE * 0, ENTRY_SIZE),
+    src: (ENTRY_SIZE * 1, ENTRY_SIZE),
+    dst: (ENTRY_SIZE * 2, ENTRY_SIZE),
+    packet_size: (ENTRY_SIZE * 3, ENTRY_SIZE),
+    hop_cnt: (ENTRY_SIZE * 4, ENTRY_SIZE),
 };
 
 impl<T> Log<T> {
@@ -88,10 +88,19 @@ pub struct CompressedLog<Scalar> {
     pub hop_cnt: Scalar,
 }
 
+impl<Scalar: PrimeField + PrimeFieldBits> CompressedLog<Scalar> {
+    fn to_leaf(&self) -> Leaf<Scalar, U1> {
+        Leaf {
+            val: vec![self.hop_cnt],
+            _arity: PhantomData::<U1>,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AggregationCircuit<
     Scalar: PrimeField + PrimeFieldBits,
-    K: Eq + Hash,
+    K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
 > {
@@ -104,7 +113,7 @@ pub struct AggregationCircuit<
 
 impl<
     Scalar: PrimeField + PrimeFieldBits,
-    K: Eq + Hash + Copy + Into<u64>,
+    K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
 > AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
@@ -164,10 +173,7 @@ impl<
 
         let merkle_leaves: Vec<_> = merkle_leaves
             .iter()
-            .map(|clog| Leaf {
-                val: vec![clog.unwrap().hop_cnt],
-                _arity: PhantomData::<U1>,
-            })
+            .map(|clog| clog.unwrap().to_leaf())
             .collect();
 
         let prev_tree =
@@ -181,15 +187,12 @@ impl<
         for log in raw_logs[new_idx..].into_iter() {
             let scalar_log = log.to_scalar_log();
             match compressed_logs.entry(log.flow_id) {
-                Entry::Occupied(clog) => {
-                    let clog = clog.into_mut();
+                Entry::Occupied(entry) => {
+                    let clog = entry.into_mut();
                     clog.hop_cnt += scalar_log.hop_cnt;
                     new_tree.insert(
                         idx_to_bits(HEIGHT, Scalar::from(clog.merkle_idx as u64)),
-                        &Leaf {
-                            val: vec![clog.hop_cnt],
-                            _arity: PhantomData::<U1>,
-                        },
+                        &clog.to_leaf(),
                     );
                     merkle_roots.push(new_tree.root);
                 }
@@ -201,10 +204,7 @@ impl<
                     entry.insert(clog.clone());
                     new_tree.insert(
                         idx_to_bits(HEIGHT, Scalar::from(merkle_idx as u64)),
-                        &Leaf {
-                            val: vec![clog.hop_cnt],
-                            _arity: PhantomData::<U1>,
-                        },
+                        &clog.to_leaf(),
                     );
                     merkle_roots.push(new_tree.root);
                     merkle_idx += 1;
@@ -291,6 +291,7 @@ impl<
 
                 batch_vars.push(packed_log_var);
 
+                // Extract hop count from bit decomposition
                 let (hop_cnt_offset, hop_cnt_sz) = LOG_OFFSETS.hop_cnt;
                 let hop_cnt_var = pack_bits(
                     cs.namespace(|| format!("log {batch_idx}-{log_idx}: hop_cnt")),
@@ -298,19 +299,21 @@ impl<
                 )?;
 
                 // Keep track of new/modified flows
-                let (old_clog, new_clog) = match new_clogs.get_mut(&log.flow_id) {
-                    Some(clog) => {
+                let (old_clog, new_clog) = match new_clogs.entry(&log.flow_id) {
+                    Entry::Occupied(entry) => {
+                        let clog = entry.into_mut();
                         let old_clog = Some((*clog).clone());
                         clog.hop_cnt += scalar_log.hop_cnt;
                         (old_clog, (*clog).clone())
                     }
-                    None => {
+                    Entry::Vacant(entry) => {
                         let (old_clog, index, old_hop_cnt) =
                             match self.old_compressed_logs.get(&log.flow_id) {
-                                Some(clog_old) => {
-                                    let old_clog = Some((*clog_old).clone());
-                                    (old_clog, clog_old.merkle_idx, clog_old.hop_cnt)
-                                }
+                                Some(clog_old) => (
+                                    Some((*clog_old).clone()),
+                                    clog_old.merkle_idx,
+                                    clog_old.hop_cnt,
+                                ),
                                 None => {
                                     let index = merkle_idx;
                                     merkle_idx += 1;
@@ -321,16 +324,13 @@ impl<
                             merkle_idx: index,
                             hop_cnt: old_hop_cnt + scalar_log.hop_cnt,
                         };
-                        new_clogs.insert(log.flow_id, clog.clone());
-                        (old_clog, clog.clone())
+                        entry.insert(clog.clone());
+                        (old_clog, clog)
                     }
                 };
 
                 let old_leaf = match old_clog {
-                    Some(clog) => Leaf {
-                        val: vec![clog.hop_cnt],
-                        _arity: PhantomData::<U1>,
-                    },
+                    Some(clog) => clog.to_leaf(),
                     None => vanilla_tree::tree::Leaf::default(),
                 };
                 let index_scalar = E::Scalar::from(new_clog.merkle_idx as u64);
@@ -398,10 +398,7 @@ impl<
                 )?;
 
                 // Update cur_tree by inserting new log
-                let new_leaf = Leaf {
-                    val: vec![new_clog.hop_cnt],
-                    _arity: PhantomData::<U1>,
-                };
+                let new_leaf = new_clog.to_leaf();
                 cur_tree.insert(index_bits.clone(), &new_leaf);
                 root_idx += 1;
 

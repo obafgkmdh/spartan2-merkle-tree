@@ -110,6 +110,9 @@ impl<
 > AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
 {
     pub fn new(raw_logs: Vec<Log<K>>, num_new_batches: usize) -> Self {
+        // TODO: This should take in old compressed logs and new raw logs, instead of old and new
+        // raw logs
+
         // Split the new logs into batches
         let new_idx = raw_logs.len() - (BATCH_SIZE * num_new_batches);
         let (batched_logs, rem) = raw_logs[new_idx..].as_chunks::<BATCH_SIZE>();
@@ -167,7 +170,9 @@ impl<
             })
             .collect();
 
-        let prev_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
+        let prev_tree = MerkleTree::from_vec(merkle_leaves.clone(), vanilla_tree::tree::Leaf::default());
+
+        let mut new_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
 
         // Compress the rest of the logs
         let mut compressed_logs = old_compressed_logs.clone();
@@ -175,35 +180,33 @@ impl<
             let scalar_log = log.to_scalar_log();
             match compressed_logs.entry(log.flow_id) {
                 Entry::Occupied(clog) => {
-                    clog.into_mut().hop_cnt += scalar_log.hop_cnt;
+                    let clog = clog.into_mut();
+                    clog.hop_cnt += scalar_log.hop_cnt;
+                    new_tree.insert(
+                        idx_to_bits(HEIGHT, Scalar::from(clog.merkle_idx as u64)),
+                        &Leaf {
+                            val: vec![clog.hop_cnt],
+                            _arity: PhantomData::<U1>,
+                        },
+                    );
                 }
                 Entry::Vacant(entry) => {
                     let clog = CompressedLog {
                         merkle_idx,
                         hop_cnt: scalar_log.hop_cnt,
                     };
-                    entry.insert(clog);
+                    entry.insert(clog.clone());
+                    new_tree.insert(
+                        idx_to_bits(HEIGHT, Scalar::from(merkle_idx as u64)),
+                        &Leaf {
+                            val: vec![clog.hop_cnt],
+                            _arity: PhantomData::<U1>,
+                        },
+                    );
                     merkle_idx += 1;
                 }
             }
         }
-
-        // Build new_tree from new compressed logs
-        let mut merkle_leaves: Vec<Option<_>> = Vec::new();
-        merkle_leaves.resize(merkle_idx, None);
-        for clog in compressed_logs.values() {
-            merkle_leaves[clog.merkle_idx] = Some(clog);
-        }
-
-        let merkle_leaves: Vec<_> = merkle_leaves
-            .iter()
-            .map(|clog| Leaf {
-                val: vec![clog.unwrap().hop_cnt],
-                _arity: PhantomData::<U1>,
-            })
-            .collect();
-
-        let new_tree = MerkleTree::from_vec(merkle_leaves, vanilla_tree::tree::Leaf::default());
 
         Self {
             raw_logs: batched_logs,
@@ -296,6 +299,13 @@ impl<
                 .map(|bit| Boolean::from(bit.clone()))
                 .collect();
 
+                let batch_var = pack_bits(
+                    cs.namespace(|| format!("batch log {idx}, var {i}")),
+                    &packed_bits,
+                )?;
+
+                batch_vars.push(batch_var);
+
                 let (hop_cnt_offset, hop_cnt_sz) = LOG_OFFSETS.hop_cnt;
                 let hop_cnt_var = pack_bits(
                     cs.namespace(|| format!("hop_cnt {idx}, var {i}")),
@@ -334,13 +344,6 @@ impl<
                         );
                     }
                 };
-
-                let batch_var = pack_bits(
-                    cs.namespace(|| format!("batch log {idx}, var {i}")),
-                    &packed_bits,
-                )?;
-
-                batch_vars.push(batch_var);
             }
 
             // Check that this batch of logs matches the public hash value
@@ -366,8 +369,7 @@ impl<
                 &mut cs.namespace(|| format!("batch hash {idx}")),
                 batch_vars,
                 &log_hash_constants,
-            )
-            .unwrap();
+            )?;
 
             cs.enforce(
                 || format!("enforce batch hash {idx} == hash {idx}"),

@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 use bellpepper::gadgets::boolean::field_into_allocated_bits_le;
+use bellpepper::gadgets::multipack::pack_bits;
 use bellpepper_core::{
     ConstraintSystem, LinearCombination, SynthesisError,
     boolean::{AllocatedBit, Boolean},
@@ -24,6 +25,7 @@ use std::cmp::Ord;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
+use std::iter::zip;
 
 #[derive(Clone, Debug)]
 pub struct Log<T> {
@@ -34,24 +36,25 @@ pub struct Log<T> {
     pub hop_cnt: T,
 }
 
+const FIELD_SIZE: usize = 32;
+const LOG_OFFSETS: Log<(usize, usize)> = Log {
+    // This defines the packing of Log fields into a Scalar. Each field takes up 32 bits in the resulting Scalar.
+    flow_id: (FIELD_SIZE * 0, FIELD_SIZE),
+    src: (FIELD_SIZE * 1, FIELD_SIZE),
+    dst: (FIELD_SIZE * 2, FIELD_SIZE),
+    packet_size: (FIELD_SIZE * 3, FIELD_SIZE),
+    hop_cnt: (FIELD_SIZE * 4, FIELD_SIZE),
+};
+
 impl<T> Log<T> {
-    fn get_offsets(&self) -> Vec<(&T, usize, usize)> {
-        // This defines the packing of Log fields into a Scalar. Each field takes up 32 bits in the
-        // resulting Scalar.
-        const FIELD_SIZE: usize = 32;
-        let mut offsets = vec![];
-        let mut offset = 0;
-        for field in vec![
+    fn fields(&self) -> Vec<&T> {
+        vec![
             &self.flow_id,
-            &self.hop_cnt,
             &self.src,
             &self.dst,
             &self.packet_size,
-        ] {
-            offsets.push((field, offset, FIELD_SIZE));
-            offset += FIELD_SIZE;
-        }
-        offsets
+            &self.hop_cnt,
+        ]
     }
 }
 
@@ -72,31 +75,10 @@ impl<Scalar: PrimeField + PrimeFieldBits> Log<Scalar> {
         // Combine fields into a single Scalar.
         let mut packed = Scalar::ZERO;
         let TWO = Scalar::from(2);
-        for (&field, offset, _nbits) in self.get_offsets() {
-            packed += field * TWO.pow(std::slice::from_ref(&(offset as u64)));
+        for (field, (offset, _nbits)) in zip(self.fields(), LOG_OFFSETS.fields()) {
+            packed += *field * TWO.pow(std::slice::from_ref(&(*offset as u64)));
         }
         packed
-    }
-
-    fn to_allocated<CS>(&self, mut cs: CS) -> Log<AllocatedNum<Scalar>>
-    where
-        CS: ConstraintSystem<Scalar>,
-    {
-        let flow_id_var =
-            AllocatedNum::alloc(cs.namespace(|| "flow_id"), || Ok(self.flow_id)).unwrap();
-        let src_var = AllocatedNum::alloc(cs.namespace(|| "src"), || Ok(self.src)).unwrap();
-        let dst_var = AllocatedNum::alloc(cs.namespace(|| "dst"), || Ok(self.dst)).unwrap();
-        let packet_size_var =
-            AllocatedNum::alloc(cs.namespace(|| "packet_size"), || Ok(self.packet_size)).unwrap();
-        let hop_cnt_var =
-            AllocatedNum::alloc(cs.namespace(|| "hop_cnt"), || Ok(self.hop_cnt)).unwrap();
-        Log {
-            flow_id: flow_id_var,
-            src: src_var,
-            dst: dst_var,
-            packet_size: packet_size_var,
-            hop_cnt: hop_cnt_var,
-        }
     }
 }
 
@@ -321,18 +303,26 @@ where
                 let scalar_log = log.to_scalar_log();
                 let packed = scalar_log.pack();
 
-                let allocated_log =
-                    scalar_log.to_allocated(cs.namespace(|| format!("allocated log {idx}-{i}")));
-                let batch_var = AllocatedNum::alloc(
-                    cs.namespace(|| format!("batch index {idx}, var {i}")),
-                    || Ok(packed),
-                )
-                .unwrap();
+                // This creates as many variables as the field size in bits, but we only use some
+                // of them. Not sure if the unused ones get eliminated
+                let packed_bits: Vec<_> = field_into_allocated_bits_le(
+                    cs.namespace(|| format!("bit decomposition {idx} {i}")),
+                    Some(packed),
+                )?
+                .iter()
+                .map(|bit| Boolean::from(bit.clone()))
+                .collect();
+
+                let (hop_cnt_offset, hop_cnt_sz) = LOG_OFFSETS.hop_cnt;
+                let hop_cnt_var = pack_bits(
+                    cs.namespace(|| format!("hop_cnt {idx}, var {i}")),
+                    &packed_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
+                )?;
 
                 // Keep track of new/modified flows
                 match modified_flows.get_mut(&log.flow_id) {
                     Some(clog) => {
-                        clog.hop_cnt = clog.hop_cnt.clone() + allocated_log.hop_cnt.get_variable();
+                        clog.hop_cnt = clog.hop_cnt.clone() + hop_cnt_var.get_variable();
                         new_clogs.get_mut(&log.flow_id).unwrap().hop_cnt += scalar_log.hop_cnt;
                     }
                     None => {
@@ -349,7 +339,7 @@ where
                             CompressedLog {
                                 merkle_idx: idx,
                                 hop_cnt: LinearCombination::from_coeff(CS::one(), old_hop_cnt)
-                                    + allocated_log.hop_cnt.get_variable(),
+                                    + hop_cnt_var.get_variable(),
                             },
                         );
                         new_clogs.insert(
@@ -362,34 +352,10 @@ where
                     }
                 };
 
-                // This creates as many variables as the field size in bits, but we only use some
-                // of them. Not sure if the unused ones get eliminated
-                let packed_bits = field_into_allocated_bits_le(
-                    cs.namespace(|| format!("bit decomposition {idx} {i}")),
-                    Some(packed),
+                let batch_var = pack_bits(
+                    cs.namespace(|| format!("batch log {idx}, var {i}")),
+                    &packed_bits,
                 )?;
-                let mut batch_lincomb = LinearCombination::zero();
-                for (field, offset, nbits) in allocated_log.get_offsets() {
-                    let bit_sum = packed_bits[offset..offset + nbits]
-                        .iter()
-                        .enumerate()
-                        .fold(LinearCombination::zero(), |acc, (i, x)| {
-                            acc + (powers_of_two[i], x.get_variable())
-                        });
-                    cs.enforce(
-                        || format!("enforce bit sum {idx}, var {i}, offset {offset} == log field"),
-                        |lc| lc + &bit_sum,
-                        |lc| lc + CS::one(),
-                        |lc| lc + field.get_variable(),
-                    );
-                    batch_lincomb = batch_lincomb + (powers_of_two[offset], field.get_variable())
-                }
-                cs.enforce(
-                    || format!("enforce batch index {idx}, var {i} == packed log"),
-                    |lc| lc + &batch_lincomb,
-                    |lc| lc + CS::one(),
-                    |lc| lc + batch_var.get_variable(),
-                );
 
                 batch_vars.push(batch_var);
             }

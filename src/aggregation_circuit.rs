@@ -250,15 +250,6 @@ impl<
         _: &[AllocatedNum<E::Scalar>], // shared variables, if any
     ) -> Result<Vec<AllocatedNum<E::Scalar>>, SynthesisError> {
         // Get merkle tree roots
-        let merkle_roots_vars = self
-            .merkle_roots
-            .iter()
-            .enumerate()
-            .map(|(i, root)| {
-                AllocatedNum::alloc(cs.namespace(|| format!("merkle root {i}")), || Ok(*root))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let merkle_roots_inputs = self
             .merkle_roots
             .iter()
@@ -271,93 +262,78 @@ impl<
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Not sure if we actually need these input constraints, may remove later
-        for (i, (merkle_root_var, merkle_root_input)) in
-            zip(merkle_roots_vars.clone(), merkle_roots_inputs).enumerate()
-        {
-            cs.enforce(
-                || format!("enforce merkle root {i} == root input"),
-                |lc| lc + merkle_root_var.get_variable(),
-                |lc| lc + CS::one(),
-                |lc| lc + merkle_root_input.get_variable(),
-            )
-        }
-
         let mut cur_tree = self.prev_tree.clone();
+        let mut root_idx = 0;
         let mut new_clogs = HashMap::<_, CompressedLog<_>>::new();
         let mut merkle_idx = self.old_compressed_logs.len();
 
-        for (idx, batch) in self.raw_logs.iter().enumerate() {
+        for (batch_idx, batch) in self.raw_logs.iter().enumerate() {
             // Allocate variables
             let mut batch_vars = Vec::new();
-            for (i, log) in batch.iter().enumerate() {
+            for (log_idx, log) in batch.iter().enumerate() {
                 let scalar_log = log.to_scalar_log();
                 let packed = scalar_log.pack();
 
                 // This creates as many variables as the field size in bits, but we only use some
                 // of them. Not sure if the unused ones get eliminated
                 let unpacked_bits: Vec<_> = field_into_allocated_bits_le(
-                    cs.namespace(|| format!("bit decomposition {idx} {i}")),
+                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: bit decomposition")),
                     Some(packed),
                 )?
                 .iter()
                 .map(|bit| Boolean::from(bit.clone()))
                 .collect();
 
-                let batch_var = pack_bits(
-                    cs.namespace(|| format!("batch log {idx}, var {i}")),
+                let packed_log_var = pack_bits(
+                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: packed log")),
                     &unpacked_bits,
                 )?;
 
-                batch_vars.push(batch_var);
+                batch_vars.push(packed_log_var);
 
                 let (hop_cnt_offset, hop_cnt_sz) = LOG_OFFSETS.hop_cnt;
                 let hop_cnt_var = pack_bits(
-                    cs.namespace(|| format!("hop_cnt {idx}, var {i}")),
+                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: hop_cnt")),
                     &unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
                 )?;
 
                 // Keep track of new/modified flows
-                let mut old_clog = None;
-                let new_clog = match new_clogs.get_mut(&log.flow_id) {
+                let (old_clog, new_clog) = match new_clogs.get_mut(&log.flow_id) {
                     Some(clog) => {
-                        old_clog = Some((*clog).clone());
+                        let old_clog = Some((*clog).clone());
                         clog.hop_cnt += scalar_log.hop_cnt;
-                        (*clog).clone()
+                        (old_clog, (*clog).clone())
                     }
                     None => {
-                        let (index, old_hop_cnt) = match self.old_compressed_logs.get(&log.flow_id)
-                        {
-                            Some(clog_old) => {
-                                old_clog = Some((*clog_old).clone());
-                                (clog_old.merkle_idx, clog_old.hop_cnt)
-                            }
-                            None => {
-                                let index = merkle_idx;
-                                merkle_idx += 1;
-                                (index, E::Scalar::ZERO)
-                            }
-                        };
+                        let (old_clog, index, old_hop_cnt) =
+                            match self.old_compressed_logs.get(&log.flow_id) {
+                                Some(clog_old) => {
+                                    let old_clog = Some((*clog_old).clone());
+                                    (old_clog, clog_old.merkle_idx, clog_old.hop_cnt)
+                                }
+                                None => {
+                                    let index = merkle_idx;
+                                    merkle_idx += 1;
+                                    (None, index, E::Scalar::ZERO)
+                                }
+                            };
                         let clog = CompressedLog {
                             merkle_idx: index,
                             hop_cnt: old_hop_cnt + scalar_log.hop_cnt,
                         };
                         new_clogs.insert(log.flow_id, clog.clone());
-                        clog.clone()
+                        (old_clog, clog.clone())
                     }
                 };
 
-                let (old_leaf, index) = match old_clog {
-                    Some(clog) => (
-                        Leaf {
-                            val: vec![clog.hop_cnt],
-                            _arity: PhantomData::<U1>,
-                        },
-                        clog.merkle_idx,
-                    ),
-                    None => (vanilla_tree::tree::Leaf::default(), merkle_idx - 1),
+                let old_leaf = match old_clog {
+                    Some(clog) => Leaf {
+                        val: vec![clog.hop_cnt],
+                        _arity: PhantomData::<U1>,
+                    },
+                    None => vanilla_tree::tree::Leaf::default(),
                 };
-                let index_scalar = E::Scalar::from(index as u64);
+                let index_scalar = E::Scalar::from(new_clog.merkle_idx as u64);
 
                 let index_bits = idx_to_bits(HEIGHT, index_scalar);
 
@@ -367,9 +343,7 @@ impl<
                     .enumerate()
                     .map(|(j, b)| {
                         AllocatedBit::alloc(
-                            cs.namespace(|| {
-                                format!("log {idx}-{i}: index {index} preimage bit {j}")
-                            }),
+                            cs.namespace(|| format!("log {batch_idx}-{log_idx}: preimage bit {j}")),
                             Some(b),
                         )
                     })
@@ -379,7 +353,7 @@ impl<
                 let siblings_path = cur_tree.get_siblings_path(index_bits.clone());
                 assert!(
                     siblings_path.verify(index_bits.clone(), &old_leaf, cur_tree.root),
-                    "log {idx}-{i}: old compressed log {index} should verify"
+                    "log {batch_idx}-{log_idx}: old compressed log should verify"
                 );
 
                 let siblings_var = siblings_path
@@ -389,7 +363,7 @@ impl<
                     .enumerate()
                     .map(|(j, s)| {
                         AllocatedNum::alloc(
-                            cs.namespace(|| format!("log {idx}-{i}: index {index} sibling {j}")),
+                            cs.namespace(|| format!("log {batch_idx}-{log_idx}: sibling {j}")),
                             || Ok(s),
                         )
                     })
@@ -401,9 +375,7 @@ impl<
                     .enumerate()
                     .map(|(j, s)| {
                         AllocatedNum::alloc(
-                            cs.namespace(|| {
-                                format!("log {idx}-{i}: index {index} old leaf val {j}")
-                            }),
+                            cs.namespace(|| format!("log {batch_idx}-{log_idx}: old leaf val {j}")),
                             || Ok(s),
                         )
                     })
@@ -413,14 +385,14 @@ impl<
                 // of a boolean
                 let is_valid_old =
                     Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-                        &mut cs.namespace(|| format!("valid old {idx}-{i}")),
-                        merkle_roots_vars[idx * BATCH_SIZE + i].clone(),
+                        &mut cs.namespace(|| format!("valid old {batch_idx}-{log_idx}")),
+                        merkle_roots_inputs[root_idx].clone(),
                         old_leaf_var.clone(),
                         index_bits_var.clone(),
                         siblings_var.clone(),
                     )?);
                 Boolean::enforce_equal(
-                    cs.namespace(|| format!("enforce true old {idx}-{i}")),
+                    cs.namespace(|| format!("enforce true old {batch_idx}-{log_idx}")),
                     &is_valid_old,
                     &Boolean::constant(true),
                 )?;
@@ -431,11 +403,12 @@ impl<
                     _arity: PhantomData::<U1>,
                 };
                 cur_tree.insert(index_bits.clone(), &new_leaf);
+                root_idx += 1;
 
                 // Verify new leaf exists in next tree
                 assert!(
                     siblings_path.verify(index_bits.clone(), &new_leaf, cur_tree.root),
-                    "log {idx}-{i}: new compressed log {index} should verify"
+                    "log {batch_idx}-{log_idx}: new compressed log should verify"
                 );
                 let new_leaf_var = new_leaf
                     .val
@@ -443,9 +416,7 @@ impl<
                     .enumerate()
                     .map(|(j, s)| {
                         AllocatedNum::alloc(
-                            cs.namespace(|| {
-                                format!("log {idx}-{i}: index {index} new leaf val {j}")
-                            }),
+                            cs.namespace(|| format!("log {batch_idx}-{log_idx}: new leaf val {j}")),
                             || Ok(s),
                         )
                     })
@@ -453,21 +424,21 @@ impl<
 
                 let is_valid_new =
                     Boolean::from(path_verify_circuit::<E::Scalar, U1, U2, HEIGHT, _>(
-                        &mut cs.namespace(|| format!("valid new {idx}-{i}")),
-                        merkle_roots_vars[idx * BATCH_SIZE + i + 1].clone(),
+                        &mut cs.namespace(|| format!("valid new {batch_idx}-{log_idx}")),
+                        merkle_roots_inputs[root_idx].clone(),
                         new_leaf_var.clone(),
                         index_bits_var.clone(),
                         siblings_var,
                     )?);
                 Boolean::enforce_equal(
-                    cs.namespace(|| format!("enforce true new {idx}-{i}")),
+                    cs.namespace(|| format!("enforce true new {batch_idx}-{log_idx}")),
                     &is_valid_new,
                     &Boolean::constant(true),
                 )?;
 
                 // Verify that new leaf is related to the old leaf
                 cs.enforce(
-                    || format!("log {idx}-{i}: enforce new leaf == old leaf + hop_cnt"),
+                    || format!("log {batch_idx}-{log_idx}: enforce new leaf == old leaf + hop_cnt"),
                     |lc| lc + old_leaf_var[0].get_variable() + hop_cnt_var.get_variable(),
                     |lc| lc + CS::one(),
                     |lc| lc + new_leaf_var[0].get_variable(),
@@ -476,32 +447,20 @@ impl<
 
             // Check that this batch of logs matches the public hash value
             let hash_input = AllocatedNum::alloc_input(
-                cs.namespace(|| format!("public batch hash {idx}")),
-                || Ok(self.hashes[idx]),
+                cs.namespace(|| format!("public batch hash {batch_idx}")),
+                || Ok(self.hashes[batch_idx]),
             )?;
-
-            let hash_var =
-                AllocatedNum::alloc(cs.namespace(|| format!("hash index {idx}")), || {
-                    Ok(self.hashes[idx])
-                })?;
-
-            cs.enforce(
-                || format!("enforce hash {idx} == hash input"),
-                |lc| lc + hash_var.get_variable(),
-                |lc| lc + CS::one(),
-                |lc| lc + hash_input.get_variable(),
-            );
 
             let log_hash_constants = Sponge::<E::Scalar, U2>::api_constants(Strength::Standard);
             let hashed_batch = hash_circuit(
-                &mut cs.namespace(|| format!("batch hash {idx}")),
+                &mut cs.namespace(|| format!("batch hash {batch_idx}")),
                 batch_vars,
                 &log_hash_constants,
             )?;
 
             cs.enforce(
-                || format!("enforce batch hash {idx} == hash {idx}"),
-                |lc| lc + hash_var.get_variable(),
+                || format!("enforce batch hash {batch_idx} == hash {batch_idx}"),
+                |lc| lc + hash_input.get_variable(),
                 |lc| lc + CS::one(),
                 |lc| lc + hashed_batch.get_variable(),
             );

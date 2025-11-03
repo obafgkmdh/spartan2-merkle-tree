@@ -400,7 +400,7 @@ impl<
                 );
                 let old_computed_root_var = path_computed_root::<E::Scalar, U1, U2, HEIGHT, _>(
                     &mut cs.namespace(|| format!("valid old {batch_idx}-{log_idx}")),
-                    vec![old_packed_clog_var],
+                    vec![old_packed_clog_var.clone()],
                     index_bits_var.clone(),
                     siblings_var.clone(),
                 )?;
@@ -431,16 +431,44 @@ impl<
                 .map(|bit| Boolean::from(bit.clone()))
                 .collect();
 
+                let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
+                let new_hop_cnt_bits =
+                    &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz];
+                let new_hop_cnt_var = pack_bits(
+                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: new clog hop_cnt")),
+                    new_hop_cnt_bits,
+                )?;
                 let new_packed_clog_var = pack_bits(
                     cs.namespace(|| format!("log {batch_idx}-{log_idx}: new packed clog")),
                     &new_unpacked_bits,
                 )?;
 
-                let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
-                let new_hop_cnt_var = pack_bits(
-                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: new clog hop_cnt")),
-                    &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
+                // Verify that new hop count is related to the old hop count
+                cs.enforce(
+                    || format!("log {batch_idx}-{log_idx}: enforce new hop_cnt == old hop_cnt + hop_cnt"),
+                    |lc| lc + old_hop_cnt_var.get_variable() + hop_cnt_var.get_variable(),
+                    |lc| lc + CS::one(),
+                    |lc| lc + new_hop_cnt_var.get_variable(),
+                );
+
+                // Reconstruct new leaf by updating hop_cnt of old leaf
+                let mut recons_unpacked_bits = old_unpacked_bits.clone();
+                recons_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz]
+                    .clone_from_slice(new_hop_cnt_bits);
+
+                let recons_packed_clog_var = pack_bits(
+                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: reconstructed packed clog")),
+                    &recons_unpacked_bits,
                 )?;
+
+                // Clog is updated, in which case it should equal the reconstructed Clog, or it's
+                // new, in which case the old packed Clog should be 0 (default leaf value)
+                cs.enforce(
+                    || format!("log {batch_idx}-{log_idx}: leaf is updated or new"),
+                    |lc| lc + new_packed_clog_var.get_variable() - recons_packed_clog_var.get_variable(),
+                    |lc| lc + old_packed_clog_var.get_variable(),
+                    |lc| lc,
+                );
 
                 // Verify membership of new compressed log
                 assert!(
@@ -462,14 +490,6 @@ impl<
                     |lc| lc + merkle_roots_inputs[root_idx].get_variable(),
                     |lc| lc + CS::one(),
                     |lc| lc + new_computed_root_var.get_variable(),
-                );
-
-                // Verify that new leaf is related to the old leaf
-                cs.enforce(
-                    || format!("log {batch_idx}-{log_idx}: enforce new leaf == old leaf + hop_cnt"),
-                    |lc| lc + old_hop_cnt_var.get_variable() + hop_cnt_var.get_variable(),
-                    |lc| lc + CS::one(),
-                    |lc| lc + new_hop_cnt_var.get_variable(),
                 );
             }
 

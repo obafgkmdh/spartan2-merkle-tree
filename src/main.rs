@@ -11,6 +11,8 @@ use tracing_subscriber::EnvFilter;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use std::collections::HashMap;
+
 mod aggregation_circuit;
 
 type E = T256HyraxEngine;
@@ -25,7 +27,27 @@ fn main() {
         .init();
 
     let mut rng = SmallRng::seed_from_u64(1);
-    let raw_logs: Vec<_> = (0..1000)
+    // Generate old raw logs
+    let old_raw_logs: Vec<_> = (0..920)
+        .map(|id| aggregation_circuit::Log::<u32> {
+            id: id,
+            flow_id: rng.random_range(0..=500),
+            src: rng.random::<u32>(),
+            dst: rng.random::<u32>(),
+            pred: rng.random::<u32>(),
+            packet_size: rng.random_range(0..=65000),
+            hop_cnt: rng.random_range(0..=50),
+        })
+        .collect();
+
+    // Compress old raw logs
+    let mut old_compressed_logs: HashMap<_, aggregation_circuit::CompressedLog<_>> = HashMap::new();
+    for log in old_raw_logs.into_iter() {
+        aggregation_circuit::update_clogs(&mut old_compressed_logs, &log);
+    }
+
+    // Generate new raw logs
+    let new_raw_logs: Vec<_> = (920..1000)
         .map(|id| aggregation_circuit::Log::<u32> {
             id: id,
             flow_id: rng.random_range(0..=500),
@@ -43,7 +65,7 @@ fn main() {
         _,
         HEIGHT,
         BATCH_SIZE,
-    >::new(raw_logs, 10);
+    >::new(old_compressed_logs, new_raw_logs);
 
     let n_new_batches = circuit.raw_logs.len();
     let n_clogs = circuit.old_compressed_logs.len();

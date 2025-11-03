@@ -77,6 +77,26 @@ impl<T: Copy + Into<u64>> Log<T> {
     }
 }
 
+pub fn update_clogs<T: Eq + Hash + Copy + Into<u64>, Scalar: PrimeField + PrimeFieldBits>(
+    compressed_logs: &mut HashMap<T, CompressedLog<Scalar>>,
+    raw_log: &Log<T>,
+) -> CompressedLog<Scalar> {
+    let scalar_log = raw_log.to_scalar_log::<Scalar>();
+    let len = compressed_logs.len();
+    match compressed_logs.entry(raw_log.flow_id) {
+        Entry::Occupied(clog) => {
+            let clog = clog.into_mut();
+            clog.hop_cnt += scalar_log.hop_cnt;
+            (*clog).clone()
+        }
+        Entry::Vacant(entry) => {
+            let clog = CompressedLog::from_idx_log(len, &scalar_log);
+            entry.insert(clog.clone());
+            clog
+        }
+    }
+}
+
 impl<Scalar: PrimeField + PrimeFieldBits> Log<Scalar> {
     fn pack(&self) -> Scalar {
         // Combine fields into a single Scalar.
@@ -98,7 +118,6 @@ pub struct CompressedLog<Scalar> {
     pub dst: Scalar,
     pub packet_size: Scalar,
     pub hop_cnt: Scalar,
-    pub version: Scalar,
 }
 
 const CLOG_OFFSETS: CompressedLog<(usize, usize)> = CompressedLog {
@@ -110,7 +129,6 @@ const CLOG_OFFSETS: CompressedLog<(usize, usize)> = CompressedLog {
     dst: (ENTRY_SIZE * 3, ENTRY_SIZE),
     packet_size: (ENTRY_SIZE * 4, ENTRY_SIZE),
     hop_cnt: (ENTRY_SIZE * 5, ENTRY_SIZE),
-    version: (ENTRY_SIZE * 6, ENTRY_SIZE),
 };
 
 impl<T> CompressedLog<T> {
@@ -123,7 +141,6 @@ impl<T> CompressedLog<T> {
             &self.dst,
             &self.packet_size,
             &self.hop_cnt,
-            &self.version,
         ]
     }
 }
@@ -145,7 +162,6 @@ impl<Scalar: PrimeField + PrimeFieldBits> CompressedLog<Scalar> {
             dst: log.dst,
             packet_size: log.packet_size,
             hop_cnt: log.hop_cnt,
-            version: Scalar::ZERO,
         }
     }
 
@@ -181,19 +197,18 @@ impl<
     const BATCH_SIZE: usize,
 > AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
 {
-    pub fn new(raw_logs: Vec<Log<K>>, num_new_batches: usize) -> Self {
-        // TODO: This should take in old compressed logs and new raw logs, instead of old and new
-        // raw logs
-
+    pub fn new(
+        old_compressed_logs: HashMap<K, CompressedLog<Scalar>>,
+        raw_logs: Vec<Log<K>>,
+    ) -> Self {
         // Split the new logs into batches
-        let new_idx = raw_logs.len() - (BATCH_SIZE * num_new_batches);
-        let (batched_logs, rem) = raw_logs[new_idx..].as_chunks::<BATCH_SIZE>();
+        let (batched_logs, rem) = raw_logs.as_chunks::<BATCH_SIZE>();
         assert_eq!(
             rem.len(),
             0,
             "Number of inputs ({}) was not a multiple of the batch size ({})",
-            rem.len(),
-            0
+            raw_logs.len(),
+            BATCH_SIZE
         );
         let batched_logs = batched_logs.to_vec();
 
@@ -207,26 +222,9 @@ impl<
             })
             .collect();
 
-        // Compress all the old logs
-        let mut old_compressed_logs: HashMap<_, CompressedLog<_>> = HashMap::new();
-        let mut merkle_idx = 0;
-        for log in raw_logs[..new_idx].into_iter() {
-            let scalar_log = log.to_scalar_log();
-            match old_compressed_logs.entry(log.flow_id) {
-                Entry::Occupied(clog) => {
-                    clog.into_mut().hop_cnt += scalar_log.hop_cnt;
-                }
-                Entry::Vacant(entry) => {
-                    let clog = CompressedLog::from_idx_log(merkle_idx, &scalar_log);
-                    entry.insert(clog);
-                    merkle_idx += 1;
-                }
-            }
-        }
-
         // Build prev_tree from old compressed logs
         let mut merkle_leaves: Vec<Option<_>> = Vec::new();
-        merkle_leaves.resize(merkle_idx, None);
+        merkle_leaves.resize(old_compressed_logs.len(), None);
         for clog in old_compressed_logs.values() {
             merkle_leaves[clog.merkle_idx] = Some(clog);
         }
@@ -242,31 +240,15 @@ impl<
         let mut new_tree = prev_tree.clone();
         let mut merkle_roots = vec![new_tree.root];
 
-        // Compress the rest of the logs
+        // Compress the new logs
         let mut compressed_logs = old_compressed_logs.clone();
-        for log in raw_logs[new_idx..].into_iter() {
-            let scalar_log = log.to_scalar_log();
-            match compressed_logs.entry(log.flow_id) {
-                Entry::Occupied(entry) => {
-                    let clog = entry.into_mut();
-                    clog.hop_cnt += scalar_log.hop_cnt;
-                    new_tree.insert(
-                        idx_to_bits(HEIGHT, Scalar::from(clog.merkle_idx as u64)),
-                        &clog.to_leaf(),
-                    );
-                    merkle_roots.push(new_tree.root);
-                }
-                Entry::Vacant(entry) => {
-                    let clog = CompressedLog::from_idx_log(merkle_idx, &scalar_log);
-                    entry.insert(clog.clone());
-                    new_tree.insert(
-                        idx_to_bits(HEIGHT, Scalar::from(merkle_idx as u64)),
-                        &clog.to_leaf(),
-                    );
-                    merkle_roots.push(new_tree.root);
-                    merkle_idx += 1;
-                }
-            }
+        for log in raw_logs.into_iter() {
+            let clog = update_clogs(&mut compressed_logs, &log);
+            new_tree.insert(
+                idx_to_bits(HEIGHT, Scalar::from(clog.merkle_idx as u64)),
+                &clog.to_leaf(),
+            );
+            merkle_roots.push(new_tree.root);
         }
 
         Self {
@@ -321,8 +303,7 @@ impl<
 
         let mut cur_tree = self.prev_tree.clone();
         let mut root_idx = 0;
-        let mut new_clogs = HashMap::<_, CompressedLog<_>>::new();
-        let mut merkle_idx = self.old_compressed_logs.len();
+        let mut compressed_logs = self.old_compressed_logs.clone();
 
         for (batch_idx, batch) in self.raw_logs.iter().enumerate() {
             // Allocate variables
@@ -356,34 +337,12 @@ impl<
                 )?;
 
                 // Keep track of new/modified flows
-                let (old_clog, new_clog) = match new_clogs.entry(&log.flow_id) {
-                    Entry::Occupied(entry) => {
-                        let clog = entry.into_mut();
-                        let old_clog = Some((*clog).clone());
-                        clog.hop_cnt += scalar_log.hop_cnt;
-                        (old_clog, (*clog).clone())
-                    }
-                    Entry::Vacant(entry) => match self.old_compressed_logs.get(&log.flow_id) {
-                        Some(clog_old) => {
-                            let old_clog = Some((*clog_old).clone());
-                            let mut new_clog = (*clog_old).clone();
-                            new_clog.hop_cnt = clog_old.hop_cnt + scalar_log.hop_cnt;
-                            entry.insert(new_clog.clone());
-                            (old_clog, new_clog)
-                        }
-                        None => {
-                            let new_clog = CompressedLog::from_idx_log(merkle_idx, &scalar_log);
-                            entry.insert(new_clog.clone());
-                            merkle_idx += 1;
-                            (None, new_clog)
-                        }
-                    },
-                };
-
-                let old_leaf = match old_clog {
+                let old_leaf = match compressed_logs.get(&log.flow_id) {
                     Some(clog) => clog.to_leaf(),
                     None => vanilla_tree::tree::Leaf::default(),
                 };
+                let new_clog = update_clogs(&mut compressed_logs, log);
+
                 let index_bits = idx_to_bits(HEIGHT, E::Scalar::from(new_clog.merkle_idx as u64));
 
                 let index_bits_var = index_bits

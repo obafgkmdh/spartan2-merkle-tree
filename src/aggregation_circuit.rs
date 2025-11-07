@@ -57,6 +57,7 @@ impl<T> Log<T> {
             &self.flow_id,
             &self.src,
             &self.dst,
+            &self.pred,
             &self.packet_size,
             &self.hop_cnt,
         ]
@@ -351,7 +352,7 @@ impl<
                     .enumerate()
                     .map(|(j, b)| {
                         AllocatedBit::alloc(
-                            cs.namespace(|| format!("log {batch_idx}-{log_idx}: preimage bit {j}")),
+                            cs.namespace(|| format!("log {batch_idx}-{log_idx}: index bit {j}")),
                             Some(b),
                         )
                     })

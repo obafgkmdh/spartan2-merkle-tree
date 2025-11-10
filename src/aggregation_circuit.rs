@@ -270,8 +270,11 @@ impl<
 > SpartanCircuit<E> for AggregationCircuit<E::Scalar, K, HEIGHT, BATCH_SIZE>
 {
     fn public_values(&self) -> Result<Vec<<E as Engine>::Scalar>, SynthesisError> {
-        // Previous and new tree roots are public, along with public batch hashes
-        let mut public_values = self.merkle_roots.clone();
+        // Previous and last tree roots are public, along with public batch hashes
+        let mut public_values = vec![
+            self.merkle_roots[0].clone(),
+            self.merkle_roots.last().unwrap().clone(),
+        ];
         public_values.extend(&self.hashes);
         Ok(public_values)
     }
@@ -295,10 +298,14 @@ impl<
             .iter()
             .enumerate()
             .map(|(i, root)| {
-                AllocatedNum::alloc_input(
-                    cs.namespace(|| format!("public merkle root {i}")),
-                    || Ok(*root),
-                )
+                if i == 0 || i == self.merkle_roots.len() - 1 {
+                    AllocatedNum::alloc_input(
+                        cs.namespace(|| format!("public merkle root {i}")),
+                        || Ok(*root),
+                    )
+                } else {
+                    AllocatedNum::alloc(cs.namespace(|| format!("merkle root {i}")), || Ok(*root))
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -458,7 +465,9 @@ impl<
                     .clone_from_slice(new_hop_cnt_bits);
 
                 let recons_packed_clog_var = pack_bits(
-                    cs.namespace(|| format!("log {batch_idx}-{log_idx}: reconstructed packed clog")),
+                    cs.namespace(|| {
+                        format!("log {batch_idx}-{log_idx}: reconstructed packed clog")
+                    }),
                     &recons_unpacked_bits,
                 )?;
 
@@ -466,7 +475,10 @@ impl<
                 // new, in which case the old packed Clog should be 0 (default leaf value)
                 cs.enforce(
                     || format!("log {batch_idx}-{log_idx}: leaf is updated or new"),
-                    |lc| lc + new_packed_clog_var.get_variable() - recons_packed_clog_var.get_variable(),
+                    |lc| {
+                        lc + new_packed_clog_var.get_variable()
+                            - recons_packed_clog_var.get_variable()
+                    },
                     |lc| lc + old_packed_clog_var.get_variable(),
                     |lc| lc,
                 );

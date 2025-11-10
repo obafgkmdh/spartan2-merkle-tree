@@ -12,14 +12,18 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use std::collections::HashMap;
+use std::env;
 
 mod aggregation_circuit;
 
 type E = T256HyraxEngine;
 const HEIGHT: usize = 15;
-const BATCH_SIZE: usize = 8;
+const BATCH_SIZE: usize = 10;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let n_new_logs: u32 = args[1].parse().unwrap();
+
     tracing_subscriber::fmt()
         .with_target(false)
         .with_ansi(true) // no bold colour codes
@@ -28,7 +32,7 @@ fn main() {
 
     let mut rng = SmallRng::seed_from_u64(1);
     // Generate old raw logs
-    let old_raw_logs: Vec<_> = (0..920)
+    let old_raw_logs: Vec<_> = (0..1000)
         .map(|id| aggregation_circuit::Log::<u32> {
             id: id,
             flow_id: rng.random_range(0..=500),
@@ -47,7 +51,7 @@ fn main() {
     }
 
     // Generate new raw logs
-    let new_raw_logs: Vec<_> = (920..1000)
+    let new_raw_logs: Vec<_> = (1000..1000 + n_new_logs)
         .map(|id| aggregation_circuit::Log::<u32> {
             id: id,
             flow_id: rng.random_range(0..=500),

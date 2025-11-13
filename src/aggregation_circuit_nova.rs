@@ -462,20 +462,21 @@ impl<
             _ => panic!("Expected 4 elements"),
         };
 
-        let step_count_inv = self.step_count.invert().unwrap_or(Scalar::ZERO);
+        let step_count_inv = self.step_count.invert().unwrap_or(Scalar::ONE);
         let step_count_inv_var =
             AllocatedNum::alloc(cs.namespace(|| "step count inverse"), || Ok(step_count_inv))?;
+        step_count_inv_var.assert_nonzero(cs.namespace(|| "step count inverse is invertible"))?;
 
-        let step_count_invertible = AllocatedNum::alloc(
-            cs.namespace(|| "1 if step count is invertible, else 0"),
-            || Ok(self.step_count * step_count_inv),
+        let step_count_invertible = step_count.mul(
+            cs.namespace(|| "1 if step_count invertible, else 0"),
+            &step_count_inv_var,
         )?;
 
         cs.enforce(
-            || "step_count * step_count_inv == step_count_invertible",
-            |lc| lc + step_count.get_variable(),
-            |lc| lc + step_count_inv_var.get_variable(),
+            || "step_count_invertible is a boolean",
             |lc| lc + step_count_invertible.get_variable(),
+            |lc| lc + step_count_invertible.get_variable() - CS::one(),
+            |lc| lc,
         );
 
         cs.enforce(
@@ -490,6 +491,26 @@ impl<
             |lc| lc + hash_chain.get_variable(),
             |lc| lc + step_count_invertible.get_variable() - CS::one(),
             |lc| lc,
+        );
+
+        let unpacked_step_bits: Vec<_> = field_into_allocated_bits_le(
+            cs.namespace(|| format!("step count bit decomposition")),
+            Some(self.step_count),
+        )?
+        .iter()
+        .map(|bit| Boolean::from(bit.clone()))
+        .collect();
+
+        let packed_step_var = pack_bits(
+            cs.namespace(|| format!("step count packed, 128 bits")),
+            &unpacked_step_bits[..128]
+        )?;
+
+        cs.enforce(
+            || "step_count < 2^128",
+            |lc| lc + packed_step_var.get_variable(),
+            |lc| lc + CS::one(),
+            |lc| lc + step_count.get_variable(),
         );
 
         let mut cur_root = prev_root.clone();

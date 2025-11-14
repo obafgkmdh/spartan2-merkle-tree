@@ -117,7 +117,13 @@ fn run_nova_circuit(n_new_logs: u32) {
     type S1 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E1, EE1>; // non-preprocessing SNARK
     type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
     type Scalar = <<E1 as nova_snark::traits::Engine>::GE as Group>::Scalar;
-    type C = aggregation_circuit_nova::AggregationCircuit<Scalar, u32, HEIGHT, BATCH_SIZE, BATCHES_PER_STEP>;
+    type C = aggregation_circuit_nova::AggregationCircuit<
+        Scalar,
+        u32,
+        HEIGHT,
+        BATCH_SIZE,
+        BATCHES_PER_STEP,
+    >;
 
     let mut rng = SmallRng::seed_from_u64(1);
     // Generate old raw logs

@@ -406,43 +406,47 @@ impl<
         let mut hash_chain = Scalar::ZERO;
 
         // Create circuits
-        let circuits: Vec<_> = step_logs.iter().enumerate().map(|(step, batches)| {
-            let mut circuit_idxs = Vec::new();
-            let mut circuit_siblings = Vec::new();
-            let mut circuit_old_clogs = Vec::new();
-            for batch in batches {
-                let mut idxs: Vec<usize> = Vec::new();
-                let mut siblings: Vec<Vec<Scalar>> = Vec::new();
-                let mut old_clogs: Vec<Option<CompressedLog<Scalar>>> = Vec::new();
+        let circuits: Vec<_> = step_logs
+            .iter()
+            .enumerate()
+            .map(|(step, batches)| {
+                let mut circuit_idxs = Vec::new();
+                let mut circuit_siblings = Vec::new();
+                let mut circuit_old_clogs = Vec::new();
+                for batch in batches {
+                    let mut idxs: Vec<usize> = Vec::new();
+                    let mut siblings: Vec<Vec<Scalar>> = Vec::new();
+                    let mut old_clogs: Vec<Option<CompressedLog<Scalar>>> = Vec::new();
 
-                for log in batch.into_iter() {
-                    let old_clog = compressed_logs.get(&log.flow_id).cloned();
-                    let clog = update_clogs(&mut compressed_logs, &log);
-                    let idx = clog.merkle_idx;
-                    let idx_bits = idx_to_bits(HEIGHT, Scalar::from(idx as u64));
-                    new_tree.insert(idx_bits.clone(), &clog.to_leaf());
-                    let siblings_path = new_tree.get_siblings_path(idx_bits);
-                    siblings.push(siblings_path.siblings);
-                    idxs.push(idx);
-                    old_clogs.push(old_clog);
+                    for log in batch.into_iter() {
+                        let old_clog = compressed_logs.get(&log.flow_id).cloned();
+                        let clog = update_clogs(&mut compressed_logs, &log);
+                        let idx = clog.merkle_idx;
+                        let idx_bits = idx_to_bits(HEIGHT, Scalar::from(idx as u64));
+                        new_tree.insert(idx_bits.clone(), &clog.to_leaf());
+                        let siblings_path = new_tree.get_siblings_path(idx_bits);
+                        siblings.push(siblings_path.siblings);
+                        idxs.push(idx);
+                        old_clogs.push(old_clog);
+                    }
+
+                    let scalar_logs = batch.iter().map(|log| log.to_scalar_log().pack()).collect();
+                    let batch_hash = hash_U2(scalar_logs, &log_hash_constants);
+                    hash_chain = hash_U2(vec![hash_chain, batch_hash], &log_hash_constants);
+
+                    circuit_idxs.push(idxs.try_into().unwrap());
+                    circuit_siblings.push(siblings.try_into().unwrap());
+                    circuit_old_clogs.push(old_clogs.try_into().unwrap());
                 }
-
-                let scalar_logs = batch.iter().map(|log| log.to_scalar_log().pack()).collect();
-                let batch_hash = hash_U2(scalar_logs, &log_hash_constants);
-                hash_chain = hash_U2(vec![hash_chain, batch_hash], &log_hash_constants);
-
-                circuit_idxs.push(idxs.try_into().unwrap());
-                circuit_siblings.push(siblings.try_into().unwrap());
-                circuit_old_clogs.push(old_clogs.try_into().unwrap());
-            }
-            Self {
-                raw_logs: batches.clone(),
-                idxs: circuit_idxs.try_into().unwrap(),
-                siblings: circuit_siblings.try_into().unwrap(),
-                old_clogs: circuit_old_clogs.try_into().unwrap(),
-                step_count: Scalar::from(step as u64),
-            }
-        }).collect::<Vec<_>>();
+                Self {
+                    raw_logs: batches.clone(),
+                    idxs: circuit_idxs.try_into().unwrap(),
+                    siblings: circuit_siblings.try_into().unwrap(),
+                    old_clogs: circuit_old_clogs.try_into().unwrap(),
+                    step_count: Scalar::from(step as u64),
+                }
+            })
+            .collect::<Vec<_>>();
         let n_steps = circuits.len();
         (
             circuits,
@@ -650,7 +654,8 @@ impl<
                 .collect();
 
                 let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
-                let new_hop_cnt_bits = &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz];
+                let new_hop_cnt_bits =
+                    &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz];
                 let new_hop_cnt_var = pack_bits(
                     cs.namespace(|| format!("log {log_idx}: new clog hop_cnt")),
                     new_hop_cnt_bits,
@@ -683,7 +688,8 @@ impl<
                 cs.enforce(
                     || format!("log {log_idx}: leaf is updated or new"),
                     |lc| {
-                        lc + new_packed_clog_var.get_variable() - recons_packed_clog_var.get_variable()
+                        lc + new_packed_clog_var.get_variable()
+                            - recons_packed_clog_var.get_variable()
                     },
                     |lc| lc + old_packed_clog_var.get_variable(),
                     |lc| lc,

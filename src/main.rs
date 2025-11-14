@@ -21,6 +21,7 @@ mod aggregation_circuit_nova;
 
 const HEIGHT: usize = 15;
 const BATCH_SIZE: usize = 10;
+const BATCHES_PER_STEP: usize = 5;
 
 fn run_spartan_circuit(n_new_logs: u32) {
     let mut rng = SmallRng::seed_from_u64(1);
@@ -116,7 +117,7 @@ fn run_nova_circuit(n_new_logs: u32) {
     type S1 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E1, EE1>; // non-preprocessing SNARK
     type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
     type Scalar = <<E1 as nova_snark::traits::Engine>::GE as Group>::Scalar;
-    type C = aggregation_circuit_nova::AggregationCircuit<Scalar, u32, HEIGHT, BATCH_SIZE>;
+    type C = aggregation_circuit_nova::AggregationCircuit<Scalar, u32, HEIGHT, BATCH_SIZE, BATCHES_PER_STEP>;
 
     let mut rng = SmallRng::seed_from_u64(1);
     // Generate old raw logs
@@ -153,7 +154,7 @@ fn run_nova_circuit(n_new_logs: u32) {
         .collect();
 
     // Create circuits
-    let (circuits, (prev_root, cur_root, hash_chain, n_steps)) =
+    let (circuits, (pub_prev_root, pub_cur_root, pub_hash_chain, pub_n_steps)) =
         C::new_circuits(&old_compressed_logs, new_raw_logs);
 
     let t0 = Instant::now();
@@ -162,14 +163,14 @@ fn run_nova_circuit(n_new_logs: u32) {
     let pp_ms = t0.elapsed().as_millis();
     info!(elapsed_ms = pp_ms, "public_params");
 
-    let initial_state = &[prev_root, prev_root, Scalar::zero(), Scalar::zero()];
+    let initial_state = &[pub_prev_root, pub_prev_root, Scalar::zero(), Scalar::zero()];
 
-    let n_new_batches = circuits.len();
+    let n_steps = circuits.len();
     let n_clogs = old_compressed_logs.len();
-    let root_span = info_span!("bench", HEIGHT, n_new_batches, BATCH_SIZE, n_clogs).entered();
+    let root_span = info_span!("bench", HEIGHT, n_steps, BATCH_SIZE, n_clogs).entered();
     info!(
-        "======= height={}, n_new_batches={}, batch_size={}, n_clogs={} =======",
-        HEIGHT, n_new_batches, BATCH_SIZE, n_clogs
+        "======= height={}, n_steps={}, batches_per_step={}, batch_size={}, n_clogs={} =======",
+        HEIGHT, n_steps, BATCHES_PER_STEP, BATCH_SIZE, n_clogs
     );
 
     // Create recursive SNARK
@@ -183,11 +184,13 @@ fn run_nova_circuit(n_new_logs: u32) {
         assert!(res.is_ok());
     }
     let prove_ms = t0.elapsed().as_millis();
+    let step_ms = prove_ms / (n_steps as u128);
+    info!(elapsed_ms = step_ms, "prove_step");
     info!(elapsed_ms = prove_ms, "prove");
 
     // VERIFY
     let t0 = Instant::now();
-    let res = recursive_snark.verify(&pp, n_new_batches, initial_state);
+    let res = recursive_snark.verify(&pp, n_steps, initial_state);
     let verify_ms = t0.elapsed().as_millis();
     info!(elapsed_ms = verify_ms, "verify");
     assert!(res.is_ok());
@@ -218,7 +221,7 @@ fn run_nova_circuit(n_new_logs: u32) {
 
     // COMPRESSED VERIFY
     let t0 = Instant::now();
-    let res = compressed_snark.verify(&vk, n_new_batches, initial_state);
+    let res = compressed_snark.verify(&vk, n_steps, initial_state);
     let compressed_verify_ms = t0.elapsed().as_millis();
     assert!(res.is_ok());
     info!(elapsed_ms = compressed_verify_ms, "compressed_verify");
@@ -227,10 +230,10 @@ fn run_nova_circuit(n_new_logs: u32) {
     let final_state = res.unwrap();
     match &final_state[..] {
         [a, b, c, d] => {
-            assert!(*a == prev_root);
-            assert!(*b == cur_root);
-            assert!(*c == hash_chain);
-            assert!(*d == n_steps);
+            assert!(*a == pub_prev_root);
+            assert!(*b == pub_cur_root);
+            assert!(*c == pub_hash_chain);
+            assert!(*d == pub_n_steps);
         }
         _ => panic!("Expected 4 elements"),
     };
@@ -238,12 +241,14 @@ fn run_nova_circuit(n_new_logs: u32) {
     // Summary
     info!(
         concat!(
-            "SUMMARY n_new_batches={}, batch_size={}, ",
-            "pub_params={} ms, prove={} ms, verify={} ms, comp_prove={} ms, comp_verify={} ms",
+            "SUMMARY n_steps={}, batches_per_step={}, batch_size={}, ",
+            "pub_params={} ms, prove_step={} ms, prove={} ms, verify={} ms, comp_prove={} ms, comp_verify={} ms",
         ),
-        n_new_batches,
+        n_steps,
+        BATCHES_PER_STEP,
         BATCH_SIZE,
         pp_ms,
+        step_ms,
         prove_ms,
         verify_ms,
         compressed_prove_ms,

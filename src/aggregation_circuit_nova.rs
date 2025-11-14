@@ -340,11 +340,12 @@ pub struct AggregationCircuit<
     K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
+    const BATCHES_PER_STEP: usize,
 > {
-    pub raw_logs: [Log<K>; BATCH_SIZE], // Single batch of raw logs from router
-    pub idxs: [usize; BATCH_SIZE],
-    pub siblings: [Vec<Scalar>; BATCH_SIZE],
-    pub old_clogs: [Option<CompressedLog<Scalar>>; BATCH_SIZE], // Old compressed logs
+    pub raw_logs: [[Log<K>; BATCH_SIZE]; BATCHES_PER_STEP], // Single batch of raw logs from router
+    pub idxs: [[usize; BATCH_SIZE]; BATCHES_PER_STEP],
+    pub siblings: [[Vec<Scalar>; BATCH_SIZE]; BATCHES_PER_STEP],
+    pub old_clogs: [[Option<CompressedLog<Scalar>>; BATCH_SIZE]; BATCHES_PER_STEP], // Old compressed logs
     pub step_count: Scalar,
 }
 
@@ -353,7 +354,8 @@ impl<
     K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
-> AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
+    const BATCHES_PER_STEP: usize,
+> AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE, BATCHES_PER_STEP>
 {
     // Outputs a vector of circuits, and also the expected (public) final state
     pub fn new_circuits(
@@ -370,6 +372,15 @@ impl<
             BATCH_SIZE
         );
         let batched_logs = batched_logs.to_vec();
+
+        let (step_logs, rem) = batched_logs.as_chunks::<BATCHES_PER_STEP>();
+        assert_eq!(
+            rem.len(),
+            0,
+            "Number of batches ({}) was not a multiple of batches_per_step ({})",
+            batched_logs.len(),
+            BATCHES_PER_STEP
+        );
 
         // Build prev_tree from old compressed logs
         let mut merkle_leaves: Vec<Option<_>> = Vec::new();
@@ -395,10 +406,11 @@ impl<
         let mut hash_chain = Scalar::ZERO;
 
         // Create circuits
-        let circuits = batched_logs
-            .iter()
-            .enumerate()
-            .map(|(step, batch)| {
+        let circuits: Vec<_> = step_logs.iter().enumerate().map(|(step, batches)| {
+            let mut circuit_idxs = Vec::new();
+            let mut circuit_siblings = Vec::new();
+            let mut circuit_old_clogs = Vec::new();
+            for batch in batches {
                 let mut idxs: Vec<usize> = Vec::new();
                 let mut siblings: Vec<Vec<Scalar>> = Vec::new();
                 let mut old_clogs: Vec<Option<CompressedLog<Scalar>>> = Vec::new();
@@ -419,15 +431,18 @@ impl<
                 let batch_hash = hash_U2(scalar_logs, &log_hash_constants);
                 hash_chain = hash_U2(vec![hash_chain, batch_hash], &log_hash_constants);
 
-                Self {
-                    raw_logs: batch.clone(),
-                    idxs: idxs.try_into().unwrap(),
-                    siblings: siblings.try_into().unwrap(),
-                    old_clogs: old_clogs.try_into().unwrap(),
-                    step_count: Scalar::from(step as u64),
-                }
-            })
-            .collect::<Vec<_>>();
+                circuit_idxs.push(idxs.try_into().unwrap());
+                circuit_siblings.push(siblings.try_into().unwrap());
+                circuit_old_clogs.push(old_clogs.try_into().unwrap());
+            }
+            Self {
+                raw_logs: batches.clone(),
+                idxs: circuit_idxs.try_into().unwrap(),
+                siblings: circuit_siblings.try_into().unwrap(),
+                old_clogs: circuit_old_clogs.try_into().unwrap(),
+                step_count: Scalar::from(step as u64),
+            }
+        }).collect::<Vec<_>>();
         let n_steps = circuits.len();
         (
             circuits,
@@ -446,7 +461,8 @@ impl<
     K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
-> StepCircuit<Scalar> for AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
+    const BATCHES_PER_STEP: usize,
+> StepCircuit<Scalar> for AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE, BATCHES_PER_STEP>
 {
     fn arity(&self) -> usize {
         4
@@ -503,7 +519,7 @@ impl<
 
         let packed_step_var = pack_bits(
             cs.namespace(|| format!("step count packed, 128 bits")),
-            &unpacked_step_bits[..128]
+            &unpacked_step_bits[..128],
         )?;
 
         cs.enforce(
@@ -514,187 +530,190 @@ impl<
         );
 
         let mut cur_root = prev_root.clone();
+        let mut new_hash_chain = hash_chain.clone();
 
-        let mut batch_vars = Vec::new();
-        for log_idx in 0..BATCH_SIZE {
-            let log = &self.raw_logs[log_idx];
-            let idx = self.idxs[log_idx];
-            let siblings = &self.siblings[log_idx];
-            let old_clog = &self.old_clogs[log_idx];
+        for batch_idx in 0..BATCHES_PER_STEP {
+            let mut batch_vars = Vec::new();
+            for log_idx in 0..BATCH_SIZE {
+                let log = &self.raw_logs[batch_idx][log_idx];
+                let idx = self.idxs[batch_idx][log_idx];
+                let siblings = &self.siblings[batch_idx][log_idx];
+                let old_clog = &self.old_clogs[batch_idx][log_idx];
 
-            let scalar_log = log.to_scalar_log();
-            let packed = scalar_log.pack();
+                let scalar_log = log.to_scalar_log();
+                let packed = scalar_log.pack();
 
-            // This creates as many variables as the field size in bits, but we only use some
-            // of them. Not sure if the unused ones get eliminated
-            let unpacked_bits: Vec<_> = field_into_allocated_bits_le(
-                cs.namespace(|| format!("log {log_idx}: bit decomposition")),
-                Some(packed),
-            )?
-            .iter()
-            .map(|bit| Boolean::from(bit.clone()))
-            .collect();
+                // This creates as many variables as the field size in bits, but we only use some
+                // of them. Not sure if the unused ones get eliminated
+                let unpacked_bits: Vec<_> = field_into_allocated_bits_le(
+                    cs.namespace(|| format!("log {log_idx}: bit decomposition")),
+                    Some(packed),
+                )?
+                .iter()
+                .map(|bit| Boolean::from(bit.clone()))
+                .collect();
 
-            let packed_log_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: packed log")),
-                &unpacked_bits,
+                let packed_log_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: packed log")),
+                    &unpacked_bits,
+                )?;
+
+                batch_vars.push(packed_log_var);
+
+                // Extract hop count from bit decomposition
+                let (hop_cnt_offset, hop_cnt_sz) = LOG_OFFSETS.hop_cnt;
+                let hop_cnt_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: hop_cnt")),
+                    &unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
+                )?;
+
+                // Keep track of new/modified flows
+                let (old_leaf, new_clog) = match old_clog {
+                    Some(clog) => {
+                        let mut new_clog = clog.clone();
+                        new_clog.hop_cnt += scalar_log.hop_cnt;
+                        (clog.to_leaf(), new_clog)
+                    }
+                    None => (
+                        vanilla_tree::tree::Leaf::default(),
+                        CompressedLog::from_idx_log(idx, &scalar_log),
+                    ),
+                };
+
+                let index_bits = idx_to_bits(HEIGHT, Scalar::from(idx as u64));
+
+                let index_bits_var = index_bits
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, b)| {
+                        AllocatedBit::alloc(
+                            cs.namespace(|| format!("log {log_idx}: index bit {j}")),
+                            Some(b),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let siblings_var = siblings
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, s)| {
+                        AllocatedNum::alloc(
+                            cs.namespace(|| format!("log {log_idx}: sibling {j}")),
+                            || Ok(s),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Extract old hop count from bit decomposition
+                let old_unpacked_bits: Vec<_> = field_into_allocated_bits_le(
+                    cs.namespace(|| format!("log {log_idx}: old clog bit decomposition")),
+                    Some(old_leaf.val[0]),
+                )?
+                .iter()
+                .map(|bit| Boolean::from(bit.clone()))
+                .collect();
+
+                let old_packed_clog_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: old packed clog")),
+                    &old_unpacked_bits,
+                )?;
+
+                let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
+                let old_hop_cnt_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: old clog hop_cnt")),
+                    &old_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
+                )?;
+
+                // Verify membership of old compressed log
+                let old_computed_root_var = path_computed_root::<Scalar, HEIGHT, _>(
+                    &mut cs.namespace(|| format!("valid old {log_idx}")),
+                    vec![old_packed_clog_var.clone()],
+                    index_bits_var.clone(),
+                    siblings_var.clone(),
+                )?;
+                cs.enforce(
+                    || format!("log {log_idx}: enforce current root == old computed root"),
+                    |lc| lc + cur_root.get_variable(),
+                    |lc| lc + CS::one(),
+                    |lc| lc + old_computed_root_var.get_variable(),
+                );
+
+                // Extract new hop count from bit decomposition
+                let new_unpacked_bits: Vec<_> = field_into_allocated_bits_le(
+                    cs.namespace(|| format!("log {log_idx}: new clog bit decomposition")),
+                    Some(new_clog.pack()),
+                )?
+                .iter()
+                .map(|bit| Boolean::from(bit.clone()))
+                .collect();
+
+                let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
+                let new_hop_cnt_bits = &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz];
+                let new_hop_cnt_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: new clog hop_cnt")),
+                    new_hop_cnt_bits,
+                )?;
+                let new_packed_clog_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: new packed clog")),
+                    &new_unpacked_bits,
+                )?;
+
+                // Verify that new hop count is related to the old hop count
+                cs.enforce(
+                    || format!("log {log_idx}: enforce new hop_cnt == old hop_cnt + hop_cnt"),
+                    |lc| lc + old_hop_cnt_var.get_variable() + hop_cnt_var.get_variable(),
+                    |lc| lc + CS::one(),
+                    |lc| lc + new_hop_cnt_var.get_variable(),
+                );
+
+                // Reconstruct new leaf by updating hop_cnt of old leaf
+                let mut recons_unpacked_bits = old_unpacked_bits.clone();
+                recons_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz]
+                    .clone_from_slice(new_hop_cnt_bits);
+
+                let recons_packed_clog_var = pack_bits(
+                    cs.namespace(|| format!("log {log_idx}: reconstructed packed clog")),
+                    &recons_unpacked_bits,
+                )?;
+
+                // Clog is updated, in which case it should equal the reconstructed Clog, or it's
+                // new, in which case the old packed Clog should be 0 (default leaf value)
+                cs.enforce(
+                    || format!("log {log_idx}: leaf is updated or new"),
+                    |lc| {
+                        lc + new_packed_clog_var.get_variable() - recons_packed_clog_var.get_variable()
+                    },
+                    |lc| lc + old_packed_clog_var.get_variable(),
+                    |lc| lc,
+                );
+
+                // Compute root for new compressed log
+                let new_computed_root_var = path_computed_root::<Scalar, HEIGHT, _>(
+                    &mut cs.namespace(|| format!("log {log_idx}: new computed root")),
+                    vec![new_packed_clog_var],
+                    index_bits_var.clone(),
+                    siblings_var.clone(),
+                )?;
+                // Update current root
+                cur_root = new_computed_root_var.clone();
+            }
+
+            // Compute hash for this batch of logs
+            let log_hash_constants = Sponge::<Scalar, U2>::api_constants(Strength::Standard);
+            let hashed_batch = hash_circuit_U2(
+                &mut cs.namespace(|| format!("batch hash")),
+                batch_vars,
+                &log_hash_constants,
             )?;
 
-            batch_vars.push(packed_log_var);
-
-            // Extract hop count from bit decomposition
-            let (hop_cnt_offset, hop_cnt_sz) = LOG_OFFSETS.hop_cnt;
-            let hop_cnt_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: hop_cnt")),
-                &unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
+            new_hash_chain = hash_circuit_U2(
+                &mut cs.namespace(|| format!("hash chain")),
+                vec![new_hash_chain.clone(), hashed_batch],
+                &log_hash_constants,
             )?;
-
-            // Keep track of new/modified flows
-            let (old_leaf, new_clog) = match old_clog {
-                Some(clog) => {
-                    let mut new_clog = clog.clone();
-                    new_clog.hop_cnt += scalar_log.hop_cnt;
-                    (clog.to_leaf(), new_clog)
-                }
-                None => (
-                    vanilla_tree::tree::Leaf::default(),
-                    CompressedLog::from_idx_log(idx, &scalar_log),
-                ),
-            };
-
-            let index_bits = idx_to_bits(HEIGHT, Scalar::from(idx as u64));
-
-            let index_bits_var = index_bits
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(j, b)| {
-                    AllocatedBit::alloc(
-                        cs.namespace(|| format!("log {log_idx}: index bit {j}")),
-                        Some(b),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let siblings_var = siblings
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(j, s)| {
-                    AllocatedNum::alloc(
-                        cs.namespace(|| format!("log {log_idx}: sibling {j}")),
-                        || Ok(s),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Extract old hop count from bit decomposition
-            let old_unpacked_bits: Vec<_> = field_into_allocated_bits_le(
-                cs.namespace(|| format!("log {log_idx}: old clog bit decomposition")),
-                Some(old_leaf.val[0]),
-            )?
-            .iter()
-            .map(|bit| Boolean::from(bit.clone()))
-            .collect();
-
-            let old_packed_clog_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: old packed clog")),
-                &old_unpacked_bits,
-            )?;
-
-            let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
-            let old_hop_cnt_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: old clog hop_cnt")),
-                &old_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz],
-            )?;
-
-            // Verify membership of old compressed log
-            let old_computed_root_var = path_computed_root::<Scalar, HEIGHT, _>(
-                &mut cs.namespace(|| format!("valid old {log_idx}")),
-                vec![old_packed_clog_var.clone()],
-                index_bits_var.clone(),
-                siblings_var.clone(),
-            )?;
-            cs.enforce(
-                || format!("log {log_idx}: enforce current root == old computed root"),
-                |lc| lc + cur_root.get_variable(),
-                |lc| lc + CS::one(),
-                |lc| lc + old_computed_root_var.get_variable(),
-            );
-
-            // Extract new hop count from bit decomposition
-            let new_unpacked_bits: Vec<_> = field_into_allocated_bits_le(
-                cs.namespace(|| format!("log {log_idx}: new clog bit decomposition")),
-                Some(new_clog.pack()),
-            )?
-            .iter()
-            .map(|bit| Boolean::from(bit.clone()))
-            .collect();
-
-            let (hop_cnt_offset, hop_cnt_sz) = CLOG_OFFSETS.hop_cnt;
-            let new_hop_cnt_bits = &new_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz];
-            let new_hop_cnt_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: new clog hop_cnt")),
-                new_hop_cnt_bits,
-            )?;
-            let new_packed_clog_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: new packed clog")),
-                &new_unpacked_bits,
-            )?;
-
-            // Verify that new hop count is related to the old hop count
-            cs.enforce(
-                || format!("log {log_idx}: enforce new hop_cnt == old hop_cnt + hop_cnt"),
-                |lc| lc + old_hop_cnt_var.get_variable() + hop_cnt_var.get_variable(),
-                |lc| lc + CS::one(),
-                |lc| lc + new_hop_cnt_var.get_variable(),
-            );
-
-            // Reconstruct new leaf by updating hop_cnt of old leaf
-            let mut recons_unpacked_bits = old_unpacked_bits.clone();
-            recons_unpacked_bits[hop_cnt_offset..hop_cnt_offset + hop_cnt_sz]
-                .clone_from_slice(new_hop_cnt_bits);
-
-            let recons_packed_clog_var = pack_bits(
-                cs.namespace(|| format!("log {log_idx}: reconstructed packed clog")),
-                &recons_unpacked_bits,
-            )?;
-
-            // Clog is updated, in which case it should equal the reconstructed Clog, or it's
-            // new, in which case the old packed Clog should be 0 (default leaf value)
-            cs.enforce(
-                || format!("log {log_idx}: leaf is updated or new"),
-                |lc| {
-                    lc + new_packed_clog_var.get_variable() - recons_packed_clog_var.get_variable()
-                },
-                |lc| lc + old_packed_clog_var.get_variable(),
-                |lc| lc,
-            );
-
-            // Compute root for new compressed log
-            let new_computed_root_var = path_computed_root::<Scalar, HEIGHT, _>(
-                &mut cs.namespace(|| format!("log {log_idx}: new computed root")),
-                vec![new_packed_clog_var],
-                index_bits_var.clone(),
-                siblings_var.clone(),
-            )?;
-            // Update current root
-            cur_root = new_computed_root_var.clone();
         }
-
-        // Compute hash for this batch of logs
-        let log_hash_constants = Sponge::<Scalar, U2>::api_constants(Strength::Standard);
-        let hashed_batch = hash_circuit_U2(
-            &mut cs.namespace(|| format!("batch hash")),
-            batch_vars,
-            &log_hash_constants,
-        )?;
-
-        let new_hash_chain = hash_circuit_U2(
-            &mut cs.namespace(|| format!("hash chain")),
-            vec![hash_chain.clone(), hashed_batch],
-            &log_hash_constants,
-        )?;
 
         let new_step_count = AllocatedNum::alloc(cs.namespace(|| "step counter"), || {
             Ok(self.step_count + Scalar::ONE)

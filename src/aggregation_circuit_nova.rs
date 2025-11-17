@@ -335,17 +335,25 @@ impl<Scalar: PrimeField + PrimeFieldBits> CompressedLog<Scalar> {
 }
 
 #[derive(Clone, Debug)]
+pub struct Batch<
+    Scalar: PrimeField + PrimeFieldBits,
+    K: Ord + Hash + Copy + Into<u64> + Sync + Send,
+    const BATCH_SIZE: usize,
+> {
+    pub raw_logs: [Log<K>; BATCH_SIZE], // Single batch of raw logs from router
+    pub idxs: [usize; BATCH_SIZE],
+    pub siblings: [Vec<Scalar>; BATCH_SIZE],
+    pub old_clogs: [Option<CompressedLog<Scalar>>; BATCH_SIZE], // Old compressed logs
+}
+
+#[derive(Clone, Debug)]
 pub struct AggregationCircuit<
     Scalar: PrimeField + PrimeFieldBits,
     K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
-    const BATCHES_PER_STEP: usize,
 > {
-    pub raw_logs: [[Log<K>; BATCH_SIZE]; BATCHES_PER_STEP], // Single batch of raw logs from router
-    pub idxs: [[usize; BATCH_SIZE]; BATCHES_PER_STEP],
-    pub siblings: [[Vec<Scalar>; BATCH_SIZE]; BATCHES_PER_STEP],
-    pub old_clogs: [[Option<CompressedLog<Scalar>>; BATCH_SIZE]; BATCHES_PER_STEP], // Old compressed logs
+    pub batches: Vec<Batch<Scalar, K, BATCH_SIZE>>,
     pub step_count: Scalar,
 }
 
@@ -354,13 +362,13 @@ impl<
     K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
-    const BATCHES_PER_STEP: usize,
-> AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE, BATCHES_PER_STEP>
+> AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
 {
     // Outputs a vector of circuits, and also the expected (public) final state
     pub fn new_circuits(
         old_compressed_logs: &HashMap<K, CompressedLog<Scalar>>,
         raw_logs: Vec<Log<K>>,
+        batches_per_step: usize,
     ) -> (Vec<Self>, (Scalar, Scalar, Scalar, Scalar)) {
         // Split the new logs into batches
         let (batched_logs, rem) = raw_logs.as_chunks::<BATCH_SIZE>();
@@ -373,13 +381,13 @@ impl<
         );
         let batched_logs = batched_logs.to_vec();
 
-        let (step_logs, rem) = batched_logs.as_chunks::<BATCHES_PER_STEP>();
+        let step_logs_iter = batched_logs.chunks_exact(batches_per_step);
         assert_eq!(
-            rem.len(),
+            step_logs_iter.remainder().len(),
             0,
             "Number of batches ({}) was not a multiple of batches_per_step ({})",
             batched_logs.len(),
-            BATCHES_PER_STEP
+            batches_per_step
         );
 
         // Build prev_tree from old compressed logs
@@ -406,43 +414,43 @@ impl<
         let mut hash_chain = Scalar::ZERO;
 
         // Create circuits
-        let circuits: Vec<_> = step_logs
-            .iter()
+        let circuits: Vec<_> = step_logs_iter
             .enumerate()
             .map(|(step, batches)| {
-                let mut circuit_idxs = Vec::new();
-                let mut circuit_siblings = Vec::new();
-                let mut circuit_old_clogs = Vec::new();
-                for batch in batches {
-                    let mut idxs: Vec<usize> = Vec::new();
-                    let mut siblings: Vec<Vec<Scalar>> = Vec::new();
-                    let mut old_clogs: Vec<Option<CompressedLog<Scalar>>> = Vec::new();
+                let circuit_batches = batches
+                    .iter()
+                    .map(|batch| {
+                        let mut idxs: Vec<usize> = Vec::new();
+                        let mut siblings: Vec<Vec<Scalar>> = Vec::new();
+                        let mut old_clogs: Vec<Option<CompressedLog<Scalar>>> = Vec::new();
 
-                    for log in batch.into_iter() {
-                        let old_clog = compressed_logs.get(&log.flow_id).cloned();
-                        let clog = update_clogs(&mut compressed_logs, &log);
-                        let idx = clog.merkle_idx;
-                        let idx_bits = idx_to_bits(HEIGHT, Scalar::from(idx as u64));
-                        new_tree.insert(idx_bits.clone(), &clog.to_leaf());
-                        let siblings_path = new_tree.get_siblings_path(idx_bits);
-                        siblings.push(siblings_path.siblings);
-                        idxs.push(idx);
-                        old_clogs.push(old_clog);
-                    }
+                        for log in batch.into_iter() {
+                            let old_clog = compressed_logs.get(&log.flow_id).cloned();
+                            let clog = update_clogs(&mut compressed_logs, &log);
+                            let idx = clog.merkle_idx;
+                            let idx_bits = idx_to_bits(HEIGHT, Scalar::from(idx as u64));
+                            new_tree.insert(idx_bits.clone(), &clog.to_leaf());
+                            let siblings_path = new_tree.get_siblings_path(idx_bits);
+                            siblings.push(siblings_path.siblings);
+                            idxs.push(idx);
+                            old_clogs.push(old_clog);
+                        }
 
-                    let scalar_logs = batch.iter().map(|log| log.to_scalar_log().pack()).collect();
-                    let batch_hash = hash_U2(scalar_logs, &log_hash_constants);
-                    hash_chain = hash_U2(vec![hash_chain, batch_hash], &log_hash_constants);
+                        let scalar_logs =
+                            batch.iter().map(|log| log.to_scalar_log().pack()).collect();
+                        let batch_hash = hash_U2(scalar_logs, &log_hash_constants);
+                        hash_chain = hash_U2(vec![hash_chain, batch_hash], &log_hash_constants);
 
-                    circuit_idxs.push(idxs.try_into().unwrap());
-                    circuit_siblings.push(siblings.try_into().unwrap());
-                    circuit_old_clogs.push(old_clogs.try_into().unwrap());
-                }
+                        Batch {
+                            raw_logs: batch.clone(),
+                            idxs: idxs.try_into().unwrap(),
+                            siblings: siblings.try_into().unwrap(),
+                            old_clogs: old_clogs.try_into().unwrap(),
+                        }
+                    })
+                    .collect();
                 Self {
-                    raw_logs: batches.clone(),
-                    idxs: circuit_idxs.try_into().unwrap(),
-                    siblings: circuit_siblings.try_into().unwrap(),
-                    old_clogs: circuit_old_clogs.try_into().unwrap(),
+                    batches: circuit_batches,
                     step_count: Scalar::from(step as u64),
                 }
             })
@@ -465,8 +473,7 @@ impl<
     K: Ord + Hash + Copy + Into<u64> + Sync + Send,
     const HEIGHT: usize,
     const BATCH_SIZE: usize,
-    const BATCHES_PER_STEP: usize,
-> StepCircuit<Scalar> for AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE, BATCHES_PER_STEP>
+> StepCircuit<Scalar> for AggregationCircuit<Scalar, K, HEIGHT, BATCH_SIZE>
 {
     fn arity(&self) -> usize {
         4
@@ -536,15 +543,14 @@ impl<
         let mut cur_root = prev_root.clone();
         let mut new_hash_chain = hash_chain.clone();
 
-        for batch_idx in 0..BATCHES_PER_STEP {
+        for batch in self.batches.iter() {
             let mut batch_vars = Vec::new();
             for log_idx in 0..BATCH_SIZE {
-                let log = &self.raw_logs[batch_idx][log_idx];
-                let idx = self.idxs[batch_idx][log_idx];
-                let siblings = &self.siblings[batch_idx][log_idx];
-                let old_clog = &self.old_clogs[batch_idx][log_idx];
+                let idx = batch.idxs[log_idx];
+                let siblings = &batch.siblings[log_idx];
+                let old_clog = &batch.old_clogs[log_idx];
 
-                let scalar_log = log.to_scalar_log();
+                let scalar_log = batch.raw_logs[log_idx].to_scalar_log();
                 let packed = scalar_log.pack();
 
                 // This creates as many variables as the field size in bits, but we only use some

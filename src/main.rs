@@ -13,15 +13,27 @@ use tracing_subscriber::EnvFilter;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use clap::Parser;
 use std::collections::HashMap;
-use std::env;
 
 mod aggregation_circuit;
 mod aggregation_circuit_nova;
 
 const HEIGHT: usize = 15;
 const BATCH_SIZE: usize = 10;
-const BATCHES_PER_STEP: usize = 5;
+
+#[derive(Parser, Debug)]
+#[command(about, long_about=None)]
+struct Args {
+    #[arg(long, default_value_t = false)]
+    use_spartan: bool,
+
+    #[arg(short, long, default_value_t = 5)]
+    batches_per_step: u32,
+
+    #[arg(short, long)]
+    n_new_logs: u32,
+}
 
 fn run_spartan_circuit(n_new_logs: u32) {
     let mut rng = SmallRng::seed_from_u64(1);
@@ -109,7 +121,7 @@ fn run_spartan_circuit(n_new_logs: u32) {
     drop(root_span);
 }
 
-fn run_nova_circuit(n_new_logs: u32) {
+fn run_nova_circuit(n_new_logs: u32, batches_per_step: u32) {
     type E1 = Bn256EngineKZG;
     type E2 = GrumpkinEngine;
     type EE1 = nova_snark::provider::hyperkzg::EvaluationEngine<E1>;
@@ -117,13 +129,7 @@ fn run_nova_circuit(n_new_logs: u32) {
     type S1 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E1, EE1>; // non-preprocessing SNARK
     type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
     type Scalar = <<E1 as nova_snark::traits::Engine>::GE as Group>::Scalar;
-    type C = aggregation_circuit_nova::AggregationCircuit<
-        Scalar,
-        u32,
-        HEIGHT,
-        BATCH_SIZE,
-        BATCHES_PER_STEP,
-    >;
+    type C = aggregation_circuit_nova::AggregationCircuit<Scalar, u32, HEIGHT, BATCH_SIZE>;
 
     let mut rng = SmallRng::seed_from_u64(1);
     // Generate old raw logs
@@ -160,8 +166,11 @@ fn run_nova_circuit(n_new_logs: u32) {
         .collect();
 
     // Create circuits
-    let (circuits, (pub_prev_root, pub_cur_root, pub_hash_chain, pub_n_steps)) =
-        C::new_circuits(&old_compressed_logs, new_raw_logs);
+    let (circuits, (pub_prev_root, pub_cur_root, pub_hash_chain, pub_n_steps)) = C::new_circuits(
+        &old_compressed_logs,
+        new_raw_logs,
+        batches_per_step as usize,
+    );
 
     let t0 = Instant::now();
     let pp =
@@ -176,7 +185,7 @@ fn run_nova_circuit(n_new_logs: u32) {
     let root_span = info_span!("bench", HEIGHT, n_steps, BATCH_SIZE, n_clogs).entered();
     info!(
         "======= height={}, n_steps={}, batches_per_step={}, batch_size={}, n_clogs={} =======",
-        HEIGHT, n_steps, BATCHES_PER_STEP, BATCH_SIZE, n_clogs
+        HEIGHT, n_steps, batches_per_step, BATCH_SIZE, n_clogs
     );
 
     // Create recursive SNARK
@@ -251,7 +260,7 @@ fn run_nova_circuit(n_new_logs: u32) {
             "pub_params={} ms, prove_step={} ms, prove={} ms, verify={} ms, comp_prove={} ms, comp_verify={} ms",
         ),
         n_steps,
-        BATCHES_PER_STEP,
+        batches_per_step,
         BATCH_SIZE,
         pp_ms,
         step_ms,
@@ -264,8 +273,8 @@ fn run_nova_circuit(n_new_logs: u32) {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let n_new_logs: u32 = args[1].parse().unwrap();
+    let args = Args::parse();
+    let n_new_logs: u32 = args.n_new_logs;
 
     tracing_subscriber::fmt()
         .with_target(false)
@@ -273,10 +282,9 @@ fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // This should be a command line switch... I'll implement it later
-    if false {
+    if args.use_spartan {
         run_spartan_circuit(n_new_logs);
     } else {
-        run_nova_circuit(n_new_logs);
+        run_nova_circuit(n_new_logs, args.batches_per_step);
     }
 }

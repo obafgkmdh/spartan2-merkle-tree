@@ -130,11 +130,12 @@ fn run_nova_circuit(n_new_logs: u32, batches_per_step: u32) {
     type S2 = nova_snark::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
     type Scalar = <<E1 as nova_snark::traits::Engine>::GE as Group>::Scalar;
     type C = aggregation_circuit_nova::AggregationCircuit<Scalar, u32, HEIGHT, BATCH_SIZE>;
+    type Log = aggregation_circuit_nova::Log<u32>;
 
     let mut rng = SmallRng::seed_from_u64(1);
     // Generate old raw logs
     let old_raw_logs: Vec<_> = (0..1000)
-        .map(|id| aggregation_circuit_nova::Log::<u32> {
+        .map(|id| Log {
             id: id,
             flow_id: rng.random_range(0..=500),
             src: rng.random::<u32>(),
@@ -154,7 +155,7 @@ fn run_nova_circuit(n_new_logs: u32, batches_per_step: u32) {
 
     // Generate new raw logs
     let new_raw_logs: Vec<_> = (1000..1000 + n_new_logs)
-        .map(|id| aggregation_circuit_nova::Log::<u32> {
+        .map(|id| Log {
             id: id,
             flow_id: rng.random_range(0..=500),
             src: rng.random::<u32>(),
